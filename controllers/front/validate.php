@@ -5,6 +5,7 @@ if (!defined('_PS_VERSION_')) {
 
 use SNT\InscriptionPro\Service\InseeClient;
 use SNT\InscriptionPro\Service\InseeResult;
+use SNT\InscriptionPro\Service\Logger;
 use SNT\InscriptionPro\Service\SiretValidator;
 use SNT\InscriptionPro\Service\VatCalculator;
 
@@ -23,11 +24,42 @@ class Snt_inscription_proValidateModuleFrontController extends ModuleFrontContro
 
     private function buildResponse(): array
     {
+        // Rejet léger des appels hors formulaire (l'en-tête AJAX est posé par
+        // notre registration.js). N'empêche pas un abus déterminé, mais filtre
+        // le bruit et se combine au rate-limit par IP ci-dessous.
+        $requestedWith = isset($_SERVER['HTTP_X_REQUESTED_WITH'])
+            ? strtolower((string) $_SERVER['HTTP_X_REQUESTED_WITH']) : '';
+        if ($requestedWith !== 'xmlhttprequest') {
+            return ['httpCode' => 400, 'payload' => ['status' => 'invalid_request']];
+        }
+
         $siret = SiretValidator::normalize((string) Tools::getValue('siret', ''));
 
         if (!SiretValidator::isSiret($siret)) {
             return ['httpCode' => 400, 'payload' => ['status' => 'invalid_format']];
         }
+
+        // --- Rate-limiting par IP (compteur porté par la table de logs) -------
+        $logger = new Logger();
+        $ip     = Tools::getRemoteAddr();
+
+        $max = (int) Configuration::get('SNT_IP_RATELIMIT_MAX');
+        if ($max <= 0) {
+            $max = 10;
+        }
+        $window = (int) Configuration::get('SNT_IP_RATELIMIT_WINDOW');
+        if ($window <= 0) {
+            $window = 60;
+        }
+
+        $since = date('Y-m-d H:i:s', time() - $window);
+        if ($logger->repository()->countInseeCallsByIp($ip, $since) >= $max) {
+            $logger->rateLimited($ip, $siret);
+            return ['httpCode' => 429, 'payload' => ['status' => 'rate_limited']];
+        }
+        // On comptabilise l'appel AVANT de solliciter l'INSEE.
+        $logger->inseeCall($ip, $siret);
+        // ----------------------------------------------------------------------
 
         $vat = VatCalculator::fromSiret($siret);
 

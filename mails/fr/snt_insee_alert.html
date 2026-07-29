@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="fr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Incident INSEE</title>
+</head>
+<body style="margin:0;padding:0;background:#f4f5f7;font-family:Arial,Helvetica,sans-serif;color:#222;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 0;">
+        <tr>
+            <td align="center">
+                <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;overflow:hidden;">
+                    <tr>
+                        <td style="background:#b42318;padding:20px 28px;color:#ffffff;font-size:18px;font-weight:bold;">
+                            {shop_name} — Incident de vérification INSEE
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding:28px;">
+                            <p style="margin:0 0 16px;font-size:15px;line-height:1.5;">
+                                La vérification automatique d'un SIRET auprès de l'API INSEE a échoué.
+                                Un compte professionnel a été accepté <strong>en mode dégradé</strong>
+                                (raison sociale saisie manuellement) et doit être vérifié.
+                            </p>
+                            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;line-height:1.6;border-collapse:collapse;">
+                                <tr>
+                                    <td style="padding:6px 0;color:#6b7280;width:160px;">Type d'incident</td>
+                                    <td style="padding:6px 0;"><strong>{incident}</strong></td>
+                                </tr>
+                                <tr>
+                                    <td style="padding:6px 0;color:#6b7280;">SIRET concerné</td>
+                                    <td style="padding:6px 0;">{siret}</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding:6px 0;color:#6b7280;">Date / heure</td>
+                                    <td style="padding:6px 0;">{date}</td>
+                                </tr>
+                            </table>
+                            <p style="margin:20px 0 0;font-size:13px;color:#6b7280;line-height:1.5;">
+                                Pour éviter le flood, cette alerte n'est envoyée qu'une fois par heure tant que
+                                l'incident persiste. Les comptes concernés sont tracés dans les logs internes du
+                                module (type <code>account_degraded</code>).
+                            </p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="background:#f4f5f7;padding:16px 28px;font-size:12px;color:#9ca3af;">
+                            Message automatique — module SNT Inscription Pro.
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>

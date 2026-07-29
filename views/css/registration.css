@@ -56,3 +56,9 @@
     background-color: #f5f5f5;
     cursor: not-allowed;
 }
+
+/* Champ débloqué en saisie manuelle (fallback INSEE indisponible). */
+.snt-ip-manual {
+    background-color: #fffbe6;
+    border-color: #f0c000;
+}

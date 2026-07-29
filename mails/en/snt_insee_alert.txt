@@ -1,0 +1,16 @@
+{shop_name} — INSEE verification incident
+
+Automatic SIRET verification against the INSEE API failed.
+A professional account was accepted IN DEGRADED MODE (company name entered
+manually) and must be reviewed.
+
+Incident type : {incident}
+SIRET         : {siret}
+Date / time   : {date}
+
+To avoid flooding, this alert is sent at most once per hour while the incident
+lasts. Affected accounts are tracked in the module's internal logs
+(type account_degraded).
+
+--
+Automated message — SNT Inscription Pro module.

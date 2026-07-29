@@ -1,0 +1,16 @@
+{shop_name} — Incident de vérification INSEE
+
+La vérification automatique d'un SIRET auprès de l'API INSEE a échoué.
+Un compte professionnel a été accepté EN MODE DÉGRADÉ (raison sociale saisie
+manuellement) et doit être vérifié.
+
+Type d'incident : {incident}
+SIRET concerné  : {siret}
+Date / heure    : {date}
+
+Pour éviter le flood, cette alerte n'est envoyée qu'une fois par heure tant que
+l'incident persiste. Les comptes concernés sont tracés dans les logs internes
+du module (type account_degraded).
+
+--
+Message automatique — module SNT Inscription Pro.

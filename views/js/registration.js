@@ -257,7 +257,8 @@
                 break;
 
             case 'degraded':
-                setStatus('pending', 'INSEE indisponible, SIRET localement valide.');
+                setStatus('pending', 'INSEE indisponible — saisissez votre raison sociale, elle sera vérifiée par nos équipes.');
+                unlockCompanyForManual();
                 fillIfEmpty(vatInput, data.vat || computeVatFr(localSiret));
                 break;
 
@@ -265,10 +266,34 @@
                 setStatus('error', 'SIRET invalide.');
                 break;
 
+            case 'rate_limited':
+                setStatus('error', 'Trop de tentatives, merci de patienter quelques instants.');
+                break;
+
             case 'unavailable':
+                // Service momentanément indisponible : on autorise la saisie
+                // manuelle de la raison sociale plutôt que de bloquer le client.
+                setStatus('pending', 'Vérification INSEE indisponible — saisissez votre raison sociale, elle sera vérifiée par nos équipes.');
+                unlockCompanyForManual();
+                fillIfEmpty(vatInput, data.vat || computeVatFr(localSiret));
+                break;
+
             default:
                 setStatus('error', 'Impossible de vérifier le SIRET.');
         }
+    }
+
+    /**
+     * Fallback : quand l'INSEE ne peut confirmer le SIRET, on rend `company`
+     * éditable (même si SNT_IP_COMPANY_EDITABLE=false) pour ne pas bloquer
+     * l'inscription. Le serveur marque alors le compte « à vérifier ».
+     */
+    function unlockCompanyForManual() {
+        var input = fieldByName('company');
+        if (!input) return;
+        input.removeAttribute('readonly');
+        input.classList.remove('snt-ip-readonly');
+        input.classList.add('snt-ip-manual');
     }
 
     function callValidate(siret) {

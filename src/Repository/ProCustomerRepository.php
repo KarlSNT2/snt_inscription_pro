@@ -22,7 +22,7 @@ final class ProCustomerRepository
     }
 
     /**
-     * @return array{id_snt_inscription_pro:int,id_customer:int,vatNumber:?string,afe:?string,date_add:string,date_upd:string}|null
+     * @return array{id_snt_inscription_pro:int,id_customer:int,vatNumber:?string,afe:?string,needs_review:int,date_add:string,date_upd:string}|null
      */
     public function findByCustomer(int $idCustomer): ?array
     {
@@ -41,8 +41,12 @@ final class ProCustomerRepository
 
     /**
      * Upsert atomique sur (id_customer). Retourne true si l'écriture a réussi.
+     *
+     * @param bool $needsReview Marque le compte « à vérifier » (INSEE indisponible
+     *                          au moment de la création → raison sociale non
+     *                          authentifiée).
      */
-    public function upsert(int $idCustomer, ?string $vatNumber, ?string $afe): bool
+    public function upsert(int $idCustomer, ?string $vatNumber, ?string $afe, bool $needsReview = false): bool
     {
         if ($idCustomer <= 0) {
             return false;
@@ -54,9 +58,10 @@ final class ProCustomerRepository
         $existing = $this->findByCustomer($idCustomer);
         if ($existing) {
             $data = [
-                'vatNumber' => $vat,
-                'afe'       => $af,
-                'date_upd'  => $now,
+                'vatNumber'    => $vat,
+                'afe'          => $af,
+                'needs_review' => $needsReview ? 1 : 0,
+                'date_upd'     => $now,
             ];
             return (bool) $this->db->update(
                 self::TABLE,
@@ -67,12 +72,36 @@ final class ProCustomerRepository
         }
 
         return (bool) $this->db->insert(self::TABLE, [
-            'id_customer' => $idCustomer,
-            'vatNumber'   => $vat,
-            'afe'         => $af,
-            'date_add'    => $now,
-            'date_upd'    => $now,
+            'id_customer'  => $idCustomer,
+            'vatNumber'    => $vat,
+            'afe'          => $af,
+            'needs_review' => $needsReview ? 1 : 0,
+            'date_add'     => $now,
+            'date_upd'     => $now,
         ]);
+    }
+
+    /**
+     * Comptes pro marqués « à vérifier » (raison sociale non authentifiée INSEE),
+     * enrichis du nom/e-mail client pour l'affichage BO. Les plus récents d'abord.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    public function findNeedsReview(int $limit = 50): array
+    {
+        $limit = max(1, min($limit, 500));
+
+        $q = new DbQuery();
+        $q->select('p.id_customer, p.vatNumber, p.afe, p.date_upd, c.firstname, c.lastname, c.email, c.company, c.siret')
+            ->from(self::TABLE, 'p')
+            ->leftJoin('customer', 'c', 'c.id_customer = p.id_customer')
+            ->where('p.needs_review = 1')
+            ->orderBy('p.date_upd DESC')
+            ->limit($limit);
+
+        $rows = $this->db->executeS($q);
+
+        return is_array($rows) ? $rows : [];
     }
 
     public function deleteByCustomer(int $idCustomer): bool

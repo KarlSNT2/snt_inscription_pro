@@ -15,6 +15,8 @@ require_once __DIR__ . '/classes/SntInscriptionPro.php';
 use SNT\InscriptionPro\Repository\ProCustomerRepository;
 use SNT\InscriptionPro\Service\InseeClient;
 use SNT\InscriptionPro\Service\InseeResult;
+use SNT\InscriptionPro\Service\Logger;
+use SNT\InscriptionPro\Service\MailAlerter;
 use SNT\InscriptionPro\Service\SiretValidator;
 use SNT\InscriptionPro\Service\VatCalculator;
 
@@ -31,6 +33,11 @@ class Snt_Inscription_Pro extends Module
         'SNT_IP_COMPANY_EDITABLE'  => '0',
         'SNT_IP_INSEE_STRICT'      => '0',
         'SNT_IP_PURGE_ON_DOWNGRADE'=> '0',
+        'SNT_IP_SUPPORT_EMAIL'     => '',   // vide => PS_SHOP_EMAIL
+        'SNT_IP_RATELIMIT_MAX'     => '10', // appels INSEE max / fenêtre / IP
+        'SNT_IP_RATELIMIT_WINDOW'  => '60', // fenêtre du rate-limit (s)
+        'SNT_IP_LOG_RETENTION_DAYS'=> '90', // rétention des logs (jours)
+        'SNT_IP_ALERT_THROTTLE'    => '3600', // anti-flood mails d'alerte (s)
     ];
 
     private const HOOKS = [
@@ -43,12 +50,21 @@ class Snt_Inscription_Pro extends Module
     ];
 
     private ?ProCustomerRepository $repository = null;
+    private ?Logger $logger = null;
+    private ?MailAlerter $mailAlerter = null;
+
+    /**
+     * Porté entre `hookValidateCustomerFormFields` (décision INSEE) et
+     * `hookActionCustomerAccountAdd/Update` (persistance) dans la même requête :
+     * true si le compte est accepté sans validation INSEE et doit être vérifié.
+     */
+    private bool $pendingNeedsReview = false;
 
     public function __construct()
     {
         $this->name          = 'snt_inscription_pro';
         $this->tab           = 'front_office_features';
-        $this->version       = '1.0.0';
+        $this->version       = '1.1.0';
         $this->author        = 'SNT2';
         $this->need_instance = 0;
         $this->bootstrap     = true;
@@ -105,7 +121,7 @@ class Snt_Inscription_Pro extends Module
             }
         }
 
-        if (!$this->installTable() || !$this->ensureSiretColumn()) {
+        if (!$this->installTable() || !$this->installLogTable() || !$this->ensureSiretColumn()) {
             return false;
         }
 
@@ -120,11 +136,13 @@ class Snt_Inscription_Pro extends Module
 
         if (!$keepData) {
             Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'snt_inscription_pro`');
+            Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'snt_inscription_pro_log`');
         }
 
         foreach (array_keys(self::CONFIG_KEYS) as $key) {
             Configuration::deleteByName($key);
         }
+        Configuration::deleteByName('SNT_IP_LOG_LAST_PURGE_TS');
 
         return parent::uninstall();
     }
@@ -136,10 +154,31 @@ class Snt_Inscription_Pro extends Module
             `id_customer`            INT(11) UNSIGNED NOT NULL,
             `vatNumber`              VARCHAR(20)  DEFAULT NULL,
             `afe`                    VARCHAR(34)  DEFAULT NULL,
+            `needs_review`           TINYINT(1)   NOT NULL DEFAULT 0,
             `date_add`               DATETIME     NOT NULL,
             `date_upd`               DATETIME     NOT NULL,
             PRIMARY KEY (`id_snt_inscription_pro`),
             UNIQUE KEY `uniq_id_customer` (`id_customer`)
+        ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8mb4';
+
+        return (bool) Db::getInstance()->execute($sql);
+    }
+
+    private function installLogTable(): bool
+    {
+        $sql = 'CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . 'snt_inscription_pro_log` (
+            `id_log`      INT(11) UNSIGNED NOT NULL AUTO_INCREMENT,
+            `type`        VARCHAR(32)  NOT NULL,
+            `severity`    TINYINT(1)   NOT NULL DEFAULT 1,
+            `id_customer` INT(11) UNSIGNED DEFAULT NULL,
+            `siret`       VARCHAR(14)  DEFAULT NULL,
+            `ip`          VARCHAR(45)  DEFAULT NULL,
+            `message`     VARCHAR(255) DEFAULT NULL,
+            `context`     TEXT         DEFAULT NULL,
+            `date_add`    DATETIME     NOT NULL,
+            PRIMARY KEY (`id_log`),
+            KEY `idx_type_date` (`type`, `date_add`),
+            KEY `idx_ip_date` (`ip`, `date_add`)
         ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8mb4';
 
         return (bool) Db::getInstance()->execute($sql);
@@ -282,21 +321,10 @@ class Snt_Inscription_Pro extends Module
         $fields = $params['fields'] ?? [];
         $errors = [];
 
-        $isPro   = $this->extractFieldValue($fields, 'is_pro') === '1';
+        // Remise à zéro pour cette requête : sera positionné par applyInseeCheck.
+        $this->pendingNeedsReview = false;
 
-        // Verrouillage serveur de `company` quand l'édition libre est désactivée.
-        // On écrase la valeur POST par la valeur en base (ou vide en création)
-        // avant que le CustomerFormatter ne persiste le Customer.
-        if (!(bool) Configuration::get('SNT_IP_COMPANY_EDITABLE')) {
-            foreach ($fields as $field) {
-                if ($field->getName() === 'company') {
-                    $existing = ($this->context->customer && (int) $this->context->customer->id > 0)
-                        ? (string) $this->context->customer->company
-                        : '';
-                    $field->setValue($existing);
-                }
-            }
-        }
+        $isPro = $this->extractFieldValue($fields, 'is_pro') === '1';
 
         if (!$isPro) {
             return $errors;
@@ -348,8 +376,14 @@ class Snt_Inscription_Pro extends Module
 
     /**
      * Ré-appelle l'INSEE côté serveur pour ancrer company (autoritatif) et
-     * pré-remplir vatNumber si l'utilisateur ne l'a pas fourni. Gère les modes
-     * strict / dégradation gracieuse via `SNT_IP_INSEE_STRICT`.
+     * pré-remplir vatNumber. Gère les modes strict / dégradation gracieuse
+     * (`SNT_IP_INSEE_STRICT`).
+     *
+     * En mode non-strict, si l'INSEE ne peut pas confirmer le SIRET (introuvable
+     * ou indisponible), le compte est accepté avec la raison sociale SAISIE
+     * MANUELLEMENT (fallback), marqué « à vérifier » (`pendingNeedsReview`), et
+     * une alerte e-mail throttlée est envoyée au support pour les incidents
+     * d'infrastructure.
      */
     private function applyInseeCheck(?FormField $siretField, ?FormField $companyField, ?FormField $vatField): void
     {
@@ -358,7 +392,13 @@ class Snt_Inscription_Pro extends Module
         }
         $siret = SiretValidator::normalize((string) $siretField->getValue());
         if ($siret === '' || !SiretValidator::isSiret($siret)) {
-            return; // erreurs déjà remontées le cas échéant
+            return; // erreurs de format déjà remontées le cas échéant
+        }
+
+        // Le n° de TVA se dérive du SIREN sans dépendre de l'INSEE : on peut le
+        // pré-remplir quel que soit l'état du service.
+        if ($vatField && trim((string) $vatField->getValue()) === '') {
+            $vatField->setValue((string) VatCalculator::fromSiret($siret));
         }
 
         $strict = (bool) Configuration::get('SNT_IP_INSEE_STRICT');
@@ -367,35 +407,54 @@ class Snt_Inscription_Pro extends Module
         switch ($result->status) {
             case InseeResult::STATUS_FOUND:
                 if ($companyField && (bool) Configuration::get('SNT_IP_WRITE_COMPANY') && $result->company) {
+                    // Source autoritative : on écrase toute saisie cliente.
                     $companyField->setValue($result->company);
-                }
-                if ($vatField && trim((string) $vatField->getValue()) === '') {
-                    $vatField->setValue((string) VatCalculator::fromSiret($siret));
+                } elseif ($companyField && !(bool) Configuration::get('SNT_IP_COMPANY_EDITABLE')) {
+                    // Pas d'écriture INSEE mais édition libre interdite : on
+                    // verrouille sur la valeur en base pour empêcher la fraude.
+                    $companyField->setValue($this->existingCompany());
                 }
                 break;
 
             case InseeResult::STATUS_NOT_FOUND:
                 if ($strict) {
                     $siretField->addError($this->l('SIRET introuvable dans le répertoire INSEE.'));
+                    break;
                 }
+                // Non-strict : SIRET valide localement mais inconnu INSEE →
+                // fallback saisie manuelle, compte à vérifier (pas d'alerte : ce
+                // n'est pas un incident d'infrastructure).
+                $this->pendingNeedsReview = true;
                 break;
 
             case InseeResult::STATUS_INVALID_KEY:
             case InseeResult::STATUS_BAD_REQUEST:
-                if ($strict) {
-                    $siretField->addError($this->l('Impossible de vérifier le SIRET auprès de l\'INSEE.'));
-                }
-                break;
-
             case InseeResult::STATUS_RATE_LIMITED:
             case InseeResult::STATUS_UNAVAILABLE:
             default:
+                $incident = $result->reason ?: $result->status;
                 if ($strict) {
                     $siretField->addError($this->l('Service INSEE momentanément indisponible, merci de réessayer.'));
+                    break;
                 }
-                // Mode non-strict : SIRET est localement valide → on laisse passer.
+                // Non-strict : on accepte le SIRET (localement valide) avec la
+                // raison sociale saisie manuellement, et on trace/alerte.
+                $this->pendingNeedsReview = true;
+                $this->getLogger()->inseeError((string) $incident, $siret, Tools::getRemoteAddr());
+                $this->getMailAlerter()->notifyInseeDown((string) $incident, ['siret' => $siret]);
                 break;
         }
+    }
+
+    /**
+     * Raison sociale actuellement en base pour le client en contexte (ou vide
+     * en création). Sert au verrouillage anti-fraude de `company`.
+     */
+    private function existingCompany(): string
+    {
+        return ($this->context->customer && (int) $this->context->customer->id > 0)
+            ? (string) $this->context->customer->company
+            : '';
     }
 
     /**
@@ -515,11 +574,24 @@ class Snt_Inscription_Pro extends Module
             }
         }
 
+        $needsReview = $this->pendingNeedsReview;
+
         $this->getRepository()->upsert(
             $idCustomer,
             $vatNumber !== '' ? $vatNumber : null,
-            $afe       !== '' ? $afe       : null
+            $afe       !== '' ? $afe       : null,
+            $needsReview
         );
+
+        // Journalisation : création/mise à jour d'un compte pro.
+        if ($needsReview) {
+            $this->getLogger()->accountDegraded($idCustomer, $siret !== '' ? $siret : null, 'insee_unconfirmed');
+        } else {
+            $this->getLogger()->accountCreated($idCustomer, $siret !== '' ? $siret : null);
+        }
+
+        // On ne conserve pas l'état dégradé au-delà de la persistance courante.
+        $this->pendingNeedsReview = false;
     }
 
     private function handleDowngrade(Customer $customer): void
@@ -543,6 +615,22 @@ class Snt_Inscription_Pro extends Module
             $this->repository = new ProCustomerRepository();
         }
         return $this->repository;
+    }
+
+    private function getLogger(): Logger
+    {
+        if ($this->logger === null) {
+            $this->logger = new Logger();
+        }
+        return $this->logger;
+    }
+
+    private function getMailAlerter(): MailAlerter
+    {
+        if ($this->mailAlerter === null) {
+            $this->mailAlerter = new MailAlerter($this->getLogger());
+        }
+        return $this->mailAlerter;
     }
 
     /**
@@ -593,6 +681,11 @@ class Snt_Inscription_Pro extends Module
             Configuration::updateValue('SNT_IP_API_KEY', $newKey);
             $output .= $this->displayConfirmation($this->l('Nouvelle clé API générée.'));
         }
+        if (Tools::isSubmit('snt_ip_purge_logs')) {
+            $retention = (int) Configuration::get('SNT_IP_LOG_RETENTION_DAYS');
+            $deleted   = $this->getLogger()->repository()->purgeOlderThan($retention > 0 ? $retention : 90);
+            $output   .= $this->displayConfirmation(sprintf($this->l('%d ligne(s) de log purgée(s).'), $deleted));
+        }
 
         $endpointUrl = $this->getEndpointUrl();
         $currentKey  = (string) Configuration::get('SNT_IP_API_KEY');
@@ -603,7 +696,8 @@ class Snt_Inscription_Pro extends Module
             . '<code>' . htmlspecialchars($currentKey, ENT_QUOTES) . '</code>'
         );
 
-        return $output . $info . $this->renderConfigForm() . $this->renderRegenerateForm();
+        return $output . $info . $this->renderConfigForm() . $this->renderRegenerateForm()
+            . $this->renderNeedsReviewPanel() . $this->renderLogsPanel();
     }
 
     private function postProcess(): string
@@ -648,6 +742,152 @@ class Snt_Inscription_Pro extends Module
             . '</a></div>';
     }
 
+    // ------------------------------------------------------------------
+    // Écran de lecture : comptes à vérifier + logs
+    // ------------------------------------------------------------------
+
+    /**
+     * Encart listant les comptes pro acceptés sans validation INSEE
+     * (needs_review = 1), avec lien direct vers la fiche client.
+     */
+    private function renderNeedsReviewPanel(): string
+    {
+        $rows = $this->getRepository()->findNeedsReview(50);
+
+        $html = '<div class="panel"><h3><i class="icon-warning"></i> '
+            . $this->l('Comptes pro à vérifier') . '</h3>';
+
+        if (empty($rows)) {
+            return $html . '<p class="text-muted">'
+                . $this->l('Aucun compte en attente de vérification. 👍') . '</p></div>';
+        }
+
+        $html .= '<p class="text-muted">'
+            . $this->l('Raison sociale saisie manuellement car l\'INSEE n\'a pas confirmé le SIRET au moment de l\'inscription.')
+            . '</p>';
+        $html .= '<table class="table"><thead><tr>'
+            . '<th>' . $this->l('Client') . '</th>'
+            . '<th>' . $this->l('E-mail') . '</th>'
+            . '<th>' . $this->l('SIRET') . '</th>'
+            . '<th>' . $this->l('Raison sociale') . '</th>'
+            . '<th>' . $this->l('N° TVA') . '</th>'
+            . '<th>' . $this->l('Mis à jour le') . '</th>'
+            . '<th></th></tr></thead><tbody>';
+
+        foreach ($rows as $r) {
+            $idCustomer = (int) ($r['id_customer'] ?? 0);
+            $name = trim((string) ($r['firstname'] ?? '') . ' ' . (string) ($r['lastname'] ?? ''));
+            $html .= '<tr>'
+                . '<td>' . $this->esc($name !== '' ? $name : ('#' . $idCustomer)) . '</td>'
+                . '<td>' . $this->esc((string) ($r['email'] ?? '')) . '</td>'
+                . '<td><code>' . $this->esc((string) ($r['siret'] ?? '')) . '</code></td>'
+                . '<td>' . $this->esc((string) ($r['company'] ?? '')) . '</td>'
+                . '<td>' . $this->esc((string) ($r['vatNumber'] ?? '')) . '</td>'
+                . '<td>' . $this->esc((string) ($r['date_upd'] ?? '')) . '</td>'
+                . '<td><a class="btn btn-default btn-xs" href="' . $this->esc($this->customerLink($idCustomer)) . '">'
+                . '<i class="icon-search"></i> ' . $this->l('Voir') . '</a></td>'
+                . '</tr>';
+        }
+
+        return $html . '</tbody></table></div>';
+    }
+
+    /**
+     * Tableau des derniers logs internes, avec filtre par type et bouton de purge.
+     */
+    private function renderLogsPanel(): string
+    {
+        $repo  = $this->getLogger()->repository();
+        $type  = (string) Tools::getValue('snt_ip_log_type', '');
+        $types = [
+            Logger::TYPE_ACCOUNT_CREATED, Logger::TYPE_ACCOUNT_DEGRADED,
+            Logger::TYPE_INSEE_CALL, Logger::TYPE_INSEE_ERROR,
+            Logger::TYPE_API_ACCESS, Logger::TYPE_RATE_LIMITED, Logger::TYPE_ALERT_MAIL,
+        ];
+        if ($type !== '' && !in_array($type, $types, true)) {
+            $type = '';
+        }
+
+        $rows  = $repo->getRecent(100, $type !== '' ? $type : null);
+        $total = $repo->countAll();
+        $base  = AdminController::$currentIndex . '&configure=' . $this->name
+               . '&token=' . Tools::getAdminTokenLite('AdminModules');
+
+        $html = '<div class="panel"><h3><i class="icon-list"></i> '
+            . $this->l('Journal du module') . ' <span class="badge">' . (int) $total . '</span></h3>';
+
+        // Filtre par type.
+        $html .= '<div class="btn-group" style="margin-bottom:12px;">';
+        $html .= '<a class="btn btn-' . ($type === '' ? 'primary' : 'default') . ' btn-sm" href="'
+            . $this->esc($base) . '">' . $this->l('Tous') . '</a>';
+        foreach ($types as $t) {
+            $active = ($type === $t) ? 'primary' : 'default';
+            $html  .= '<a class="btn btn-' . $active . ' btn-sm" href="'
+                . $this->esc($base . '&snt_ip_log_type=' . $t) . '">' . $this->esc($t) . '</a>';
+        }
+        $html .= '</div>';
+
+        // Bouton purge.
+        $purgeUrl = $base . '&snt_ip_purge_logs=1' . ($type !== '' ? '&snt_ip_log_type=' . $type : '');
+        $html .= ' <a class="btn btn-danger btn-sm pull-right" href="' . $this->esc($purgeUrl) . '" '
+            . 'onclick="return confirm(\'' . $this->l('Purger les logs au-delà de la rétention configurée ?') . '\');">'
+            . '<i class="icon-trash"></i> ' . $this->l('Purger maintenant') . '</a>';
+
+        if (empty($rows)) {
+            return $html . '<p class="text-muted">' . $this->l('Aucun log pour ce filtre.') . '</p></div>';
+        }
+
+        $html .= '<table class="table"><thead><tr>'
+            . '<th>' . $this->l('Date') . '</th>'
+            . '<th>' . $this->l('Sévérité') . '</th>'
+            . '<th>' . $this->l('Type') . '</th>'
+            . '<th>' . $this->l('Client') . '</th>'
+            . '<th>' . $this->l('SIRET') . '</th>'
+            . '<th>' . $this->l('IP') . '</th>'
+            . '<th>' . $this->l('Message') . '</th>'
+            . '</tr></thead><tbody>';
+
+        foreach ($rows as $r) {
+            $idc = (int) ($r['id_customer'] ?? 0);
+            $html .= '<tr>'
+                . '<td style="white-space:nowrap;">' . $this->esc((string) ($r['date_add'] ?? '')) . '</td>'
+                . '<td>' . $this->severityBadge((int) ($r['severity'] ?? 1)) . '</td>'
+                . '<td><code>' . $this->esc((string) ($r['type'] ?? '')) . '</code></td>'
+                . '<td>' . ($idc > 0 ? '<a href="' . $this->esc($this->customerLink($idc)) . '">#' . $idc . '</a>' : '—') . '</td>'
+                . '<td>' . $this->esc((string) ($r['siret'] ?? '')) . '</td>'
+                . '<td>' . $this->esc((string) ($r['ip'] ?? '')) . '</td>'
+                . '<td>' . $this->esc((string) ($r['message'] ?? '')) . '</td>'
+                . '</tr>';
+        }
+
+        return $html . '</tbody></table></div>';
+    }
+
+    private function severityBadge(int $severity): string
+    {
+        switch ($severity) {
+            case Logger::SEVERITY_ERROR:
+                return '<span class="label label-danger">' . $this->l('Erreur') . '</span>';
+            case Logger::SEVERITY_WARNING:
+                return '<span class="label label-warning">' . $this->l('Attention') . '</span>';
+            default:
+                return '<span class="label label-success">' . $this->l('Info') . '</span>';
+        }
+    }
+
+    private function customerLink(int $idCustomer): string
+    {
+        return $this->context->link->getAdminLink('AdminCustomers', true, [], [
+            'id_customer'  => $idCustomer,
+            'viewcustomer' => 1,
+        ]);
+    }
+
+    private function esc(string $value): string
+    {
+        return htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
+    }
+
     private function getConfigForm(): array
     {
         return [
@@ -658,6 +898,11 @@ class Snt_Inscription_Pro extends Module
                     ['type' => 'text', 'label' => $this->l('Timeout INSEE (s)'),      'name' => 'SNT_IP_INSEE_TIMEOUT', 'size' => 5],
                     ['type' => 'text', 'label' => $this->l('Allowlist IP endpoint (CSV)'), 'name' => 'SNT_IP_API_IP_ALLOWLIST', 'size' => 64],
                     ['type' => 'text', 'label' => $this->l('Regex AFE'),              'name' => 'SNT_IP_AFE_REGEX', 'size' => 32],
+                    ['type' => 'text', 'label' => $this->l('E-mail support (alertes INSEE)'), 'name' => 'SNT_IP_SUPPORT_EMAIL', 'size' => 64],
+                    ['type' => 'text', 'label' => $this->l('Rate-limit : appels max / IP'),   'name' => 'SNT_IP_RATELIMIT_MAX', 'size' => 5],
+                    ['type' => 'text', 'label' => $this->l('Rate-limit : fenêtre (s)'),        'name' => 'SNT_IP_RATELIMIT_WINDOW', 'size' => 5],
+                    ['type' => 'text', 'label' => $this->l('Rétention des logs (jours)'),      'name' => 'SNT_IP_LOG_RETENTION_DAYS', 'size' => 5],
+                    ['type' => 'text', 'label' => $this->l('Anti-flood alertes mail (s)'),     'name' => 'SNT_IP_ALERT_THROTTLE', 'size' => 6],
                     $this->switchInput('SNT_IP_SIRET_REQUIRED',     $this->l('SIRET obligatoire si professionnel')),
                     $this->switchInput('SNT_IP_WRITE_COMPANY',      $this->l('Écrire la raison sociale depuis INSEE')),
                     $this->switchInput('SNT_IP_COMPANY_EDITABLE',   $this->l('Autoriser l\'édition libre de la raison sociale')),
