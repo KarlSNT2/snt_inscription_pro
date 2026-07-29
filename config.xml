@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module>
+    <name>snt_inscription_pro</name>
+    <displayName><![CDATA[SNT Inscription Pro]]></displayName>
+    <version><![CDATA[1.0.0]]></version>
+    <description><![CDATA[Enrichit l'inscription client PrestaShop avec les données professionnelles (SIRET vérifié INSEE, TVA intracom., AFE) sans activer le mode B2B global.]]></description>
+    <author><![CDATA[SNT2]]></author>
+    <tab><![CDATA[front_office_features]]></tab>
+    <confirmUninstall><![CDATA[Confirmer la désinstallation du module ? Les données pro clients (vatNumber, afe) seront supprimées si vous choisissez la purge complète.]]></confirmUninstall>
+    <is_configurable>1</is_configurable>
+    <need_instance>0</need_instance>
+    <limited_countries></limited_countries>
+</module>
