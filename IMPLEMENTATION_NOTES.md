@@ -279,6 +279,121 @@ Le type de log `address_locked` est ajouté à `Logger` et au filtre du panneau
 
 ---
 
+## 8quinquies. Nouveautés v1.4.0
+
+**Cache serveur INSEE — fin des doubles appels.** Le parcours normal émettait
+**2 appels INSEE par inscription** : recherche par SIREN au blur
+(`searchBySiren`, contrôleur `validate`) puis re-vérification du SIRET choisi au
+submit (`fetchSiret`, `applyInseeCheck`). Comme la recherche par SIREN renvoie
+déjà les données complètes (raison sociale + adresse) de chaque établissement, on
+les **mémorise en cache serveur** (nouvelle table
+`ps_snt_inscription_pro_insee_cache`, clé = SIRET, via
+`SNT\InscriptionPro\Repository\InseeCacheRepository`). Au blur,
+`buildFoundPayload` appelle `putMany()` sur exactement les établissements
+renvoyés au client (donc sélectionnables). Au submit, `applyInseeCheck` fait un
+`get($siret, ttl)` : **cache hit → aucun appel INSEE** (donnée réutilisée,
+toujours émise côté serveur donc autoritative) ; **cache miss** (saisie manuelle,
+TTL expiré, édition sans blur) → `fetchSiret` classique + mise en cache du
+résultat. Résultat : **1 appel INSEE par inscription** dans le flux nominal, et
+dédoublonnage de tout SIRET déjà vu (plusieurs clients, retries…).
+
+- **Sécurité inchangée** : le cache n'est alimenté que par des réponses INSEE
+  serveur, jamais par une saisie cliente. Le client ne fournit que le SIRET (clé
+  de lecture, validée Luhn). Le verrou anti-fraude de `company` reste effectif.
+- **Journal exact** : seuls les appels réellement émis sont journalisés
+  (`insee_call`). Un cache hit ne loggue rien → le compteur du BO et le
+  rate-limit restent cohérents.
+- **TTL configurable** : `SNT_IP_INSEE_CACHE_TTL` (défaut **86400 s / 1 jour**).
+  Au-delà, l'entrée est ignorée en lecture (donnée potentiellement obsolète —
+  cohérent avec la dette « déménagement » du Lot C). Le bouton « Purger
+  maintenant » du BO vide aussi le cache périmé.
+- **Migration** : `upgrade-1.4.0.php` (table + clé config, idempotent). Install
+  fraîche via `installCacheTable()`, drop à la désinstallation (sauf
+  conservation des données).
+
+> ℹ️ L'édition de compte (page `identity`) sans re-saisie du SIREN reste à 1
+> appel (cache miss → `fetchSiret`). Non optimisé volontairement : les éditions
+> sont rares et le SIRET peut ne pas être en cache.
+
+**Nettoyage** — suppression de l'ObjectModel mort `classes/SntInscriptionPro.php`
+(jamais instancié, `$definition` désynchronisée des colonnes réelles : risque de
+corruption silencieuse s'il avait été utilisé). Le `require_once` correspondant
+est retiré du module.
+
+**Sécurité endpoint API** — `providedKey()` n'accepte plus la clé en query string
+(`?key=...`) : **en-tête `X-Api-Key` uniquement**. Le repli query faisait
+transiter le secret dans les journaux serveur/proxy et le cache navigateur.
+⚠️ **Rupture** : les intégrations qui passaient la clé en query devront basculer
+sur l'en-tête HTTP.
+
+---
+
+## 8sexies. Nouveautés v1.5.0 (fondation VIES + fin de l'auto-calcul TVA)
+
+**Suppression de l'auto-calcul / auto-remplissage de la TVA.** Le numéro de TVA
+n'est **plus jamais dérivé du SIREN** (le calcul mod-97 a produit un numéro
+**erroné** pour une société réelle). Retiré partout :
+- serveur : `applyInseeCheck` (plus de `setValue` TVA), `persistProData` (plus de
+  fallback), `maybeCreateInseeAddress` (l'adresse porte désormais la TVA **saisie**
+  par le client, jamais une TVA calculée) ;
+- contrôleur `validate` : plus de champ `vat` dans le payload ;
+- JS `registration.js` : `computeVatFrFromSiren()` et tous ses appels supprimés.
+
+La classe `src/Service/VatCalculator.php` est **supprimée** (orpheline). La TVA est
+désormais **saisie par le client** et sa validité sera confirmée par **VIES**
+(source de vérité), jamais fabriquée.
+
+**Fondation VIES (moteur, non branché).** `ViesClient` (REST/JSON, sans clé,
+timeout court, dégradation gracieuse), `ViesResult` (DTO), `VatValidator` (format
+par pays UE-27 + XI, mapping ISO→VIES GR→EL), `ViesCacheRepository` (cache par n°
+TVA, table `ps_snt_inscription_pro_vies_cache`). Clés config `SNT_IP_VIES_*`,
+migration `upgrade-1.5.0.php`, types de log `vies_call`/`vies_error`. **Non câblé**
+tant que le Step 2 (sélecteur pays + `applyViesCheck` + refonte JS) n'est pas fait.
+
+---
+
+## 8septies. Nouveautés v1.5.0 — Step 2 : sélecteur pays + VIES branché
+
+**Sélecteur pays** (`pro_country`, `FormField` select UE-27 + XI, défaut FR,
+libellés `Country::getCountries`) injecté par `hookAdditionalCustomerFormFields`.
+Il **aiguille** le parcours (JS + serveur). Non persisté (routeur ; le pays réel
+est porté par le SIRET en FR ou le préfixe TVA en non-FR).
+
+**Routage serveur** (`hookValidateCustomerFormFields`) :
+- `validateFrenchPro()` — SIREN/SIRET (Luhn) + `applyInseeCheck` (company/adresse
+  autoritatives) + `applyViesCheck(..., isFr=true)` en **complément non bloquant** ;
+- `validateForeignPro()` — TVA = identifiant requis, format par pays
+  (`VatValidator`), `applyViesCheck(..., isFr=false)` **bloquant si invalide** ;
+  raison sociale = nom VIES si fourni, sinon **saisie manuelle obligatoire** ;
+  pas de SIRET/INSEE/adresse auto.
+
+**`applyViesCheck()`** — format → cache (`ViesCacheRepository`) → `ViesClient`.
+Décision : VALID (non-FR → company = nom VIES) ; INVALID (**bloquant** non-FR,
+`needs_review` en FR) ; INDISPO (strict → bloquant ; sinon `needs_review`). Seuls
+les appels réels sont journalisés (`vies_call`).
+
+**SIRET `setRequired(false)`** à l'injection (requis dynamiquement en FR côté
+serveur + JS) — évite un `required` HTML5 sur un champ masqué en non-FR.
+
+**Contrôleur `validate`** — nouveau flux VIES (`buildViesResponse`) déclenché
+quand `vat` est posté : format → rate-limit par IP (compteur `vies_call`) → cache
+→ VIES. Réponse `{status: valid|invalid|unavailable|invalid_format|rate_limited,
+name, address}`.
+
+**JS `registration.js`** — deux branches pilotées par `pro_country` :
+`applyBranch()` (masque SIREN/SIRET/établissements/téléphone en non-FR, rend la
+TVA requise + company éditable) ; `onVatBlur()` → VIES → retour visuel
+(✓ nom / ✗ invalide / ⚠ indispo) + remplissage `company`. Statut hôté sous le
+SIREN (FR) ou le n° TVA (non-FR).
+
+**BO** — champs config `SNT_IP_VIES_*`, types `vies_call`/`vies_error` au filtre
+du Journal, purge du cache VIES sur « Purger ». Expose `SNT_IP_VIES_ENABLE` au JS.
+
+> Aucune migration DB pour le Step 2 (réutilise la table cache VIES de la
+> fondation 1.5.0) : simple mise à jour des fichiers.
+
+---
+
 ## 9. Test manuel de bout en bout (Phase 1+2)
 
 - [x] Installation propre sur PS 8.x, table créée, colonne `ps_customer.siret` présente, hooks enregistrés, clé endpoint générée.

@@ -96,11 +96,16 @@ class Snt_inscription_proApiModuleFrontController extends ModuleFrontController
 
     private function providedKey(): string
     {
+        // Clé transmise EXCLUSIVEMENT via l'en-tête `X-Api-Key`. On refuse
+        // volontairement tout repli en query string (`?key=...`) : la clé s'y
+        // retrouverait journalisée par le serveur web, les proxys et le cache
+        // navigateur — fuite de secret. Les intégrations doivent positionner
+        // l'en-tête HTTP.
         if (isset($_SERVER['HTTP_X_API_KEY'])) {
             return (string) $_SERVER['HTTP_X_API_KEY'];
         }
-        // Repli : certains proxys/clients ne peuvent pas positionner l'en-tête.
-        return (string) Tools::getValue('key', '');
+
+        return '';
     }
 
     /**

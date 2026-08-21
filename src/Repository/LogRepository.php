@@ -63,10 +63,19 @@ final class LogRepository
      */
     public function countInseeCallsByIp(string $ip, string $sinceDateTime): int
     {
+        return $this->countCallsByIp('insee_call', $ip, $sinceDateTime);
+    }
+
+    /**
+     * Compte les appels d'un type donné (`insee_call`, `vies_call`…) émis par une
+     * IP depuis un instant donné. Utilisé par les rate-limiters.
+     */
+    public function countCallsByIp(string $type, string $ip, string $sinceDateTime): int
+    {
         $q = new DbQuery();
         $q->select('COUNT(*)')
             ->from(self::TABLE)
-            ->where("type = 'insee_call'")
+            ->where("type = '" . pSQL($type) . "'")
             ->where("ip = '" . pSQL($ip) . "'")
             ->where("date_add >= '" . pSQL($sinceDateTime) . "'");
 

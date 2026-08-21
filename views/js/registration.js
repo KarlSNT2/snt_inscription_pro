@@ -15,14 +15,15 @@
         window.console.debug('[SNT-IP] registration.js loaded');
     }
 
-    // `siren` (nouveau) + `siret` (autoritatif, alimenté par la sélection) +
-    // company/vatNumber + phone (création only) + accounting_email.
-    var PRO_FIELDS = ['siren', 'siret', 'company', 'vatNumber', 'phone', 'accounting_email'];
+    // pro_country (sélecteur pays) + siren/siret (branche FR) + company/vatNumber
+    // + phone (création FR) + accounting_email.
+    var PRO_FIELDS = ['pro_country', 'siren', 'siret', 'company', 'vatNumber', 'phone', 'accounting_email'];
 
     var CFG = {
         validateUrl:     window.SNT_IP_VALIDATE_URL || '',
         companyEditable: !!window.SNT_IP_COMPANY_EDITABLE,
         siretRequired:   !!window.SNT_IP_SIRET_REQUIRED,
+        viesEnable:      !!window.SNT_IP_VIES_ENABLE,
     };
 
     var LUHN_EXCEPTIONS_SIREN = ['356000000']; // La Poste
@@ -170,8 +171,141 @@
             });
         });
         if (show) {
-            // Le SIRET a une visibilité propre (piloté par la sélection).
+            // Aiguillage FR / non-FR selon le pays choisi (gère aussi le SIRET).
+            applyBranch();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Aiguillage par pays : FR (SIREN/INSEE) vs autre UE (TVA/VIES)
+    // ------------------------------------------------------------------
+
+    function currentCountry() {
+        var el = fieldByName('pro_country');
+        return el ? String(el.value || 'FR').toUpperCase() : 'FR';
+    }
+
+    function isFrCountry() {
+        return currentCountry() === 'FR';
+    }
+
+    function normalizeVat(v) {
+        return String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    }
+
+    function setWrapperVisible(name, show) {
+        var w = wrapperOf(fieldByName(name));
+        if (w) { w.style.display = show ? '' : 'none'; }
+    }
+
+    /**
+     * Affiche/masque les sous-champs selon le pays :
+     *  - FR       : SIREN + établissements + SIRET + téléphone ;
+     *  - autre UE : n° TVA (requis) + raison sociale (éditable), le reste masqué.
+     */
+    function applyBranch() {
+        if (!isProChecked()) { return; }
+        var fr = isFrCountry();
+
+        // Champs propres à la branche FR.
+        setWrapperVisible('siren', fr);
+        setWrapperVisible('phone', fr);
+
+        // Téléphone : requis pour l'adresse siège FR, inutile en non-FR (pas
+        // d'adresse auto). On pilote `required` (HTML5) selon la branche — sinon
+        // un champ requis masqué bloque la soumission
+        // (« invalid form control is not focusable »).
+        var phone = fieldByName('phone');
+        if (phone) {
+            if (fr) {
+                phone.setAttribute('required', 'required');
+                phone.dataset.sntIpRequired = '1';
+            } else {
+                phone.removeAttribute('required');
+                phone.dataset.sntIpRequired = '';
+            }
+        }
+
+        var siret = fieldByName('siret');
+        if (fr) {
             syncSiretVisibility();
+        } else {
+            var sw = wrapperOf(siret);
+            if (sw) { sw.style.display = 'none'; }
+            if (siret) { siret.removeAttribute('required'); }
+            showEtabUI(false);
+        }
+
+        // TVA : requise en non-FR, optionnelle en FR.
+        var vat = fieldByName('vatNumber');
+        if (vat) {
+            if (fr) {
+                vat.removeAttribute('required');
+                vat.dataset.sntIpRequired = '';
+            } else {
+                vat.setAttribute('required', 'required');
+                vat.dataset.sntIpRequired = '1';
+            }
+        }
+
+        // Raison sociale : éditable (saisie manuelle) en non-FR ; readonly en FR.
+        var comp = fieldByName('company');
+        if (comp) {
+            if (fr) {
+                applyCompanyReadonly();
+            } else {
+                comp.removeAttribute('readonly');
+                comp.classList.remove('snt-ip-readonly');
+            }
+        }
+
+        setStatus('', '');
+    }
+
+    // Blur du n° TVA (branche non-FR) -> vérification VIES.
+    function onVatBlur() {
+        if (!isProChecked() || isFrCountry() || !CFG.viesEnable) { return; }
+        var input = fieldByName('vatNumber');
+        if (!input) { return; }
+        var vat = normalizeVat(input.value);
+        if (vat === '') { setStatus('', ''); return; }
+        input.value = vat;
+        if (!CFG.validateUrl) { setStatus('pending', 'Vérification VIES non configurée.'); return; }
+
+        setStatus('pending', 'Vérification VIES…');
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', CFG.validateUrl, true);
+        xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
+        xhr.onload = function () {
+            var d = null;
+            try { d = JSON.parse(xhr.responseText); } catch (e) {}
+            handleViesResponse(d);
+        };
+        xhr.onerror = function () { setStatus('error', 'Erreur réseau.'); };
+        xhr.send('vat=' + encodeURIComponent(vat) + '&country=' + encodeURIComponent(currentCountry()) + '&ajax=1');
+    }
+
+    function handleViesResponse(d) {
+        switch (d && d.status) {
+            case 'valid':
+                setStatus('ok', '✓ ' + (d.name || 'Numéro de TVA valide'));
+                if (d.name) { forceFill(fieldByName('company'), d.name); }
+                break;
+            case 'invalid':
+                setStatus('error', '✗ Numéro de TVA non valide dans VIES.');
+                break;
+            case 'unavailable':
+                setStatus('pending', 'Vérification VIES indisponible — votre compte sera vérifié par nos équipes.');
+                break;
+            case 'invalid_format':
+                setStatus('error', 'Numéro de TVA au format invalide.');
+                break;
+            case 'rate_limited':
+                setStatus('error', 'Trop de tentatives, merci de patienter quelques instants.');
+                break;
+            default:
+                setStatus('error', 'Impossible de vérifier le numéro de TVA.');
         }
     }
 
@@ -243,22 +377,16 @@
         return luhnCheck(siret);
     }
 
-    function computeVatFrFromSiren(siren) {
-        var s = parseInt(siren.substring(0, 9), 10);
-        if (isNaN(s)) return '';
-        var key = (12 + 3 * (s % 97)) % 97;
-        var padded = key < 10 ? '0' + key : String(key);
-        return 'FR' + padded + siren.substring(0, 9);
-    }
-
     // ------------------------------------------------------------------
     // Statut (sous le champ SIREN)
     // ------------------------------------------------------------------
 
     function ensureStatusEl() {
-        var sirenInput = fieldByName('siren');
-        if (!sirenInput) return null;
-        var container = inlineContainerOf(sirenInput);
+        // Hôte du statut : le SIREN en branche FR, le n° TVA en branche non-FR.
+        var host = isFrCountry() ? fieldByName('siren') : fieldByName('vatNumber');
+        if (!host) { host = fieldByName('siren') || fieldByName('vatNumber'); }
+        if (!host) return null;
+        var container = inlineContainerOf(host);
         if (!container) return null;
         var el = container.querySelector('.snt-ip-status');
         if (!el) {
@@ -443,7 +571,6 @@
         if (!item) return;
         var siretInput   = fieldByName('siret');
         var companyInput = fieldByName('company');
-        var vatInput     = fieldByName('vatNumber');
 
         if (siretInput) {
             siretInput.value = String(item.siret || '');
@@ -457,8 +584,8 @@
             }
         }
 
-        var vat = computeVatFrFromSiren(String(item.siret || '').substring(0, 9));
-        fillIfEmpty(vatInput, vat);
+        // Le n° de TVA n'est plus auto-rempli (calcul mod-97 potentiellement
+        // erroné) : le client le saisit, VIES le validera.
 
         var msg = '✓ ' + (item.company || 'Établissement sélectionné');
         if (item.closed) msg += ' (établissement fermé à l\'INSEE)';
@@ -471,12 +598,12 @@
     // Fallback saisie manuelle (INSEE indisponible)
     // ------------------------------------------------------------------
 
-    function enterManualMode(vat) {
+    function enterManualMode() {
         establishmentsData = [];
         showEtabUI(false);
         setSiretMode('manual');
         unlockCompanyForManual();
-        fillIfEmpty(fieldByName('vatNumber'), vat || '');
+        // TVA non pré-remplie : saisie par le client, validée par VIES.
         var siretInput = fieldByName('siret');
         if (siretInput) {
             siretInput.setAttribute('required', 'required');
@@ -510,7 +637,6 @@
                         forceFill(companyInput, data.company);
                     }
                 }
-                fillIfEmpty(fieldByName('vatNumber'), data.vat || computeVatFrFromSiren(siren));
                 setSiretMode('hidden');
                 renderEstablishments(data.establishments || []);
                 break;
@@ -523,7 +649,7 @@
             case 'degraded':
             case 'unavailable':
                 setStatus('pending', 'Vérification INSEE indisponible — saisissez votre SIRET et votre raison sociale, ils seront vérifiés par nos équipes.');
-                enterManualMode(data.vat || computeVatFrFromSiren(siren));
+                enterManualMode();
                 break;
 
             case 'invalid_format':
@@ -546,7 +672,7 @@
         lastSearchedSiren = siren;
         if (!CFG.validateUrl) {
             setStatus('pending', 'SIREN localement valide (INSEE non configuré) — saisissez votre SIRET.');
-            enterManualMode(computeVatFrFromSiren(siren));
+            enterManualMode();
             return;
         }
         setStatus('pending', 'Recherche des établissements…');
@@ -602,7 +728,8 @@
             return;
         }
         input.value = siret;
-        fillIfEmpty(fieldByName('vatNumber'), computeVatFrFromSiren(siret.substring(0, 9)));
+        // TVA non pré-remplie (calcul mod-97 potentiellement erroné) : saisie
+        // par le client, validée par VIES.
     }
 
     // ------------------------------------------------------------------
@@ -650,6 +777,18 @@
         var siretInput = fieldByName('siret');
         if (siretInput) {
             siretInput.addEventListener('blur', onSiretManualBlur);
+        }
+
+        // Sélecteur pays : bascule la branche FR / non-FR.
+        var countryEl = fieldByName('pro_country');
+        if (countryEl) {
+            countryEl.addEventListener('change', function () { applyBranch(); });
+        }
+
+        // Blur du n° TVA : vérification VIES (branche non-FR).
+        var vatInput = fieldByName('vatNumber');
+        if (vatInput) {
+            vatInput.addEventListener('blur', onVatBlur);
         }
     });
 })();

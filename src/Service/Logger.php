@@ -29,6 +29,8 @@ final class Logger
     public const TYPE_RATE_LIMITED     = 'rate_limited';
     public const TYPE_ALERT_MAIL       = 'alert_mail';
     public const TYPE_ADDRESS_LOCKED   = 'address_locked';
+    public const TYPE_VIES_CALL        = 'vies_call';
+    public const TYPE_VIES_ERROR       = 'vies_error';
 
     // Sévérités.
     public const SEVERITY_INFO    = 1;
@@ -96,6 +98,26 @@ final class Logger
             'ip'       => $ip,
             'message'  => 'Incident INSEE : ' . $incident,
             'context'  => ['incident' => $incident],
+        ]);
+    }
+
+    public function viesCall(?string $ip, ?string $vat): void
+    {
+        $this->log(self::TYPE_VIES_CALL, [
+            'severity' => self::SEVERITY_INFO,
+            'ip'       => $ip,
+            'message'  => 'Vérification VIES',
+            'context'  => ['vat' => $vat],
+        ]);
+    }
+
+    public function viesError(string $incident, ?string $vat, ?string $ip = null): void
+    {
+        $this->log(self::TYPE_VIES_ERROR, [
+            'severity' => self::SEVERITY_ERROR,
+            'ip'       => $ip,
+            'message'  => 'Incident VIES : ' . $incident,
+            'context'  => ['incident' => $incident, 'vat' => $vat],
         ]);
     }
 

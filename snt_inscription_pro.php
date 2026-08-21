@@ -10,15 +10,17 @@ if (!defined('_PS_VERSION_')) {
     exit;
 }
 
-require_once __DIR__ . '/classes/SntInscriptionPro.php';
-
+use SNT\InscriptionPro\Repository\InseeCacheRepository;
 use SNT\InscriptionPro\Repository\ProCustomerRepository;
 use SNT\InscriptionPro\Service\InseeClient;
 use SNT\InscriptionPro\Service\InseeResult;
 use SNT\InscriptionPro\Service\Logger;
 use SNT\InscriptionPro\Service\MailAlerter;
 use SNT\InscriptionPro\Service\SiretValidator;
-use SNT\InscriptionPro\Service\VatCalculator;
+use SNT\InscriptionPro\Repository\ViesCacheRepository;
+use SNT\InscriptionPro\Service\ViesClient;
+use SNT\InscriptionPro\Service\ViesResult;
+use SNT\InscriptionPro\Service\VatValidator;
 
 class Snt_Inscription_Pro extends Module
 {
@@ -38,6 +40,11 @@ class Snt_Inscription_Pro extends Module
         'SNT_IP_RATELIMIT_WINDOW'  => '60', // fenêtre du rate-limit (s)
         'SNT_IP_LOG_RETENTION_DAYS'=> '90', // rétention des logs (jours)
         'SNT_IP_ALERT_THROTTLE'    => '3600', // anti-flood mails d'alerte (s)
+        'SNT_IP_INSEE_CACHE_TTL'   => '86400', // durée de vie du cache INSEE (s)
+        'SNT_IP_VIES_ENABLE'       => '1',      // activer la vérification VIES
+        'SNT_IP_VIES_STRICT'       => '0',      // bloquer si VIES injoignable
+        'SNT_IP_VIES_TIMEOUT'      => '5',      // timeout appel VIES (s)
+        'SNT_IP_VIES_CACHE_TTL'    => '604800', // durée de vie du cache VIES (s) — 7 j
     ];
 
     private const HOOKS = [
@@ -76,7 +83,7 @@ class Snt_Inscription_Pro extends Module
     {
         $this->name          = 'snt_inscription_pro';
         $this->tab           = 'front_office_features';
-        $this->version       = '1.3.0';
+        $this->version       = '1.5.0';
         $this->author        = 'SNT2';
         $this->need_instance = 0;
         $this->bootstrap     = true;
@@ -133,7 +140,9 @@ class Snt_Inscription_Pro extends Module
             }
         }
 
-        if (!$this->installTable() || !$this->installLogTable() || !$this->ensureSiretColumn()) {
+        if (!$this->installTable() || !$this->installLogTable()
+            || !$this->installCacheTable() || !$this->installViesCacheTable()
+            || !$this->ensureSiretColumn()) {
             return false;
         }
 
@@ -149,6 +158,8 @@ class Snt_Inscription_Pro extends Module
         if (!$keepData) {
             Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'snt_inscription_pro`');
             Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'snt_inscription_pro_log`');
+            Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'snt_inscription_pro_insee_cache`');
+            Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'snt_inscription_pro_vies_cache`');
         }
 
         foreach (array_keys(self::CONFIG_KEYS) as $key) {
@@ -193,6 +204,50 @@ class Snt_Inscription_Pro extends Module
             PRIMARY KEY (`id_log`),
             KEY `idx_type_date` (`type`, `date_add`),
             KEY `idx_ip_date` (`ip`, `date_add`)
+        ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8mb4';
+
+        return (bool) Db::getInstance()->execute($sql);
+    }
+
+    /**
+     * Cache serveur des établissements INSEE (clé = SIRET). Sert à éviter le
+     * second appel INSEE au submit quand le SIRET a déjà été vu au blur.
+     * Cf. SNT\InscriptionPro\Repository\InseeCacheRepository.
+     */
+    private function installCacheTable(): bool
+    {
+        $sql = 'CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . 'snt_inscription_pro_insee_cache` (
+            `siret`    VARCHAR(14)  NOT NULL,
+            `company`  VARCHAR(255) DEFAULT NULL,
+            `active`   TINYINT(1)   NOT NULL DEFAULT 0,
+            `closed`   TINYINT(1)   NOT NULL DEFAULT 0,
+            `address1` VARCHAR(255) DEFAULT NULL,
+            `address2` VARCHAR(255) DEFAULT NULL,
+            `postcode` VARCHAR(16)  DEFAULT NULL,
+            `city`     VARCHAR(255) DEFAULT NULL,
+            `date_add` DATETIME     NOT NULL,
+            PRIMARY KEY (`siret`),
+            KEY `idx_date_add` (`date_add`)
+        ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8mb4';
+
+        return (bool) Db::getInstance()->execute($sql);
+    }
+
+    /**
+     * Cache serveur des vérifications VIES (clé = n° TVA complet). Évite de
+     * re-solliciter VIES (lent + rate-limité) pour un numéro déjà vérifié.
+     * Cf. SNT\InscriptionPro\Repository\ViesCacheRepository.
+     */
+    private function installViesCacheTable(): bool
+    {
+        $sql = 'CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . 'snt_inscription_pro_vies_cache` (
+            `vat_number` VARCHAR(20)  NOT NULL,
+            `valid`      TINYINT(1)   NOT NULL DEFAULT 0,
+            `name`       VARCHAR(255) DEFAULT NULL,
+            `address`    VARCHAR(512) DEFAULT NULL,
+            `date_add`   DATETIME     NOT NULL,
+            PRIMARY KEY (`vat_number`),
+            KEY `idx_date_add` (`date_add`)
         ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8mb4';
 
         return (bool) Db::getInstance()->execute($sql);
@@ -273,6 +328,19 @@ class Snt_Inscription_Pro extends Module
             ])
             ->setRequired(true);
 
+        // pro_country : pays de l'entreprise. Aiguille le parcours :
+        //  - FR  -> SIREN / INSEE (+ VIES en complément) ;
+        //  - autre UE -> n° TVA seul, vérifié par VIES.
+        // Le JS masque/affiche les sous-champs selon ce choix ; le serveur route
+        // la validation dans hookValidateCustomerFormFields.
+        $additions[] = (new FormField())
+            ->setName('pro_country')
+            ->setType('select')
+            ->setLabel($this->l('Pays de l\'entreprise'))
+            ->setValue($prefill['pro_country'])
+            ->setAvailableValues($this->euCountryChoices())
+            ->setRequired(true);
+
         // siren : saisi par le client (9 chiffres). Au blur, le JS interroge
         // l'INSEE et alimente un <select> d'établissements ; la sélection écrit
         // le SIRET complet dans le champ `siret`. Non requis côté serveur (la
@@ -288,18 +356,22 @@ class Snt_Inscription_Pro extends Module
         // siret : réutilise le field existant si présent, sinon on l'ajoute.
         // Renseigné par la sélection d'établissement (JS) ou en saisie manuelle
         // dans le fallback. Reste la valeur autoritative re-vérifiée par l'INSEE.
+        // Requis géré dynamiquement : côté serveur dans la branche FR
+        // (validateFrenchPro), côté client par le JS. `setRequired(false)` ici
+        // pour NE JAMAIS bloquer un pro non-FR (SIRET masqué) via un `required`
+        // HTML5 sur un champ caché.
         if (isset($existingByName['siret'])) {
             if ($prefill['siret'] !== '') {
                 $existingByName['siret']->setValue($prefill['siret']);
             }
-            $existingByName['siret']->setRequired((bool) Configuration::get('SNT_IP_SIRET_REQUIRED'));
+            $existingByName['siret']->setRequired(false);
         } else {
             $additions[] = (new FormField())
                 ->setName('siret')
                 ->setType('text')
                 ->setLabel($this->l('SIRET'))
                 ->setValue($prefill['siret'])
-                ->setRequired((bool) Configuration::get('SNT_IP_SIRET_REQUIRED'));
+                ->setRequired(false);
         }
 
         // company : idem. Le readonly côté client est géré par le JS via
@@ -338,13 +410,17 @@ class Snt_Inscription_Pro extends Module
         // adresse PS doit porter un téléphone). Uniquement à la CRÉATION du
         // compte — à l'édition, l'adresse existe déjà (et sera verrouillée).
         // Non persisté en table module : consommé une seule fois pour l'adresse.
+        // Requis géré dynamiquement (comme le SIRET) : côté serveur uniquement en
+        // branche FR (validateFrenchPro), côté client par le JS. `setRequired(false)`
+        // ici pour NE PAS bloquer un pro non-FR (téléphone masqué) via un `required`
+        // (HTML5 ou serveur) sur un champ caché.
         if (!$this->isEditingExistingCustomer()) {
             $additions[] = (new FormField())
                 ->setName('phone')
                 ->setType('text')
                 ->setLabel($this->l('Téléphone'))
                 ->setValue('')
-                ->setRequired(true);
+                ->setRequired(false);
         }
 
         // email comptable : demandé par le service comptabilité. Persisté en
@@ -360,8 +436,10 @@ class Snt_Inscription_Pro extends Module
     }
 
     /**
-     * Validation serveur locale (Phase 1 : format + Luhn + regex AFE).
-     * La re-vérif INSEE est ajoutée en Phase 2.
+     * Validation serveur : routage selon le pays de l'entreprise.
+     *  - FR       -> SIREN/SIRET + re-vérif INSEE + VIES en complément ;
+     *  - autre UE -> n° TVA seul, vérifié par VIES (bloquant si invalide).
+     * L'email comptable est requis dans les deux branches.
      * @param array{fields: FormField[]} $params
      */
     public function hookValidateCustomerFormFields($params): array
@@ -369,79 +447,226 @@ class Snt_Inscription_Pro extends Module
         $fields = $params['fields'] ?? [];
         $errors = [];
 
-        // Remise à zéro pour cette requête : positionnés par applyInseeCheck.
+        // Remis à zéro pour cette requête : positionnés par applyInseeCheck /
+        // applyViesCheck.
         $this->pendingNeedsReview  = false;
         $this->pendingInseeAddress = [];
 
-        $isPro = $this->extractFieldValue($fields, 'is_pro') === '1';
-
-        if (!$isPro) {
+        if ($this->extractFieldValue($fields, 'is_pro') !== '1') {
             return $errors;
         }
 
-        $siretField   = null;
-        $companyField = null;
-        $vatField     = null;
-
+        $byName = [];
         foreach ($fields as $field) {
-            switch ($field->getName()) {
-                case 'siren':
-                    // Non requis (la valeur autoritative est le SIRET) mais si
-                    // renseigné, on vérifie le format 9 chiffres + Luhn.
-                    $siren = SiretValidator::normalize((string) $field->getValue());
-                    if ($siren !== '' && !SiretValidator::isSiren($siren)) {
-                        $field->addError($this->l('SIREN invalide : 9 chiffres attendus et clé de contrôle Luhn incorrecte.'));
-                    }
-                    break;
+            $byName[$field->getName()] = $field;
+        }
 
-                case 'siret':
-                    $siretField = $field;
-                    $siret = SiretValidator::normalize((string) $field->getValue());
-                    if ((bool) Configuration::get('SNT_IP_SIRET_REQUIRED') && $siret === '') {
-                        $field->addError($this->l('Le SIRET est obligatoire pour un compte professionnel.'));
-                    } elseif ($siret !== '' && !SiretValidator::isSiret($siret)) {
-                        $field->addError($this->l('SIRET invalide : 14 chiffres attendus et clé de contrôle Luhn incorrecte.'));
-                    }
-                    break;
-
-                case 'company':
-                    $companyField = $field;
-                    break;
-
-                case 'vatNumber':
-                    $vatField = $field;
-                    $vat = strtoupper(preg_replace('/\s+/', '', (string) $field->getValue()));
-                    if ($vat !== '' && !preg_match('/^[A-Z]{2}[A-Z0-9]{2,13}$/', $vat)) {
-                        $field->addError($this->l('N° TVA intracommunautaire au format invalide.'));
-                    }
-                    break;
-
-                case 'phone':
-                    // Injecté uniquement à la création (cf. formulaire) : requis
-                    // pour l'adresse « siège social ».
-                    $phone = trim((string) $field->getValue());
-                    if ($phone === '') {
-                        $field->addError($this->l('Le téléphone est obligatoire pour un compte professionnel.'));
-                    } elseif (!Validate::isPhoneNumber($phone)) {
-                        $field->addError($this->l('Numéro de téléphone invalide.'));
-                    }
-                    break;
-
-                case 'accounting_email':
-                    $accEmail = trim((string) $field->getValue());
-                    if ($accEmail === '') {
-                        $field->addError($this->l('L\'email comptable est obligatoire pour un compte professionnel.'));
-                    } elseif (!Validate::isEmail($accEmail)) {
-                        $field->addError($this->l('Email comptable invalide.'));
-                    }
-                    break;
+        // Email comptable : requis quel que soit le pays.
+        if (isset($byName['accounting_email'])) {
+            $accEmail = trim((string) $byName['accounting_email']->getValue());
+            if ($accEmail === '') {
+                $byName['accounting_email']->addError($this->l('L\'email comptable est obligatoire pour un compte professionnel.'));
+            } elseif (!Validate::isEmail($accEmail)) {
+                $byName['accounting_email']->addError($this->l('Email comptable invalide.'));
             }
         }
 
-        // Re-vérification INSEE serveur (n'est jamais dérivée du blur AJAX).
-        $this->applyInseeCheck($siretField, $companyField, $vatField);
+        $country = strtoupper(trim((string) ($this->extractFieldValue($fields, 'pro_country') ?? 'FR')));
+        if ($country === '') {
+            $country = 'FR';
+        }
+
+        if ($country === 'FR') {
+            $this->validateFrenchPro($byName);
+        } else {
+            $this->validateForeignPro($byName, $country);
+        }
 
         return $errors;
+    }
+
+    /**
+     * Branche FR : SIREN/SIRET (Luhn) + re-vérif INSEE (autoritative pour company
+     * et adresse siège) + VIES en complément (non bloquant) sur la TVA saisie.
+     *
+     * @param array<string,FormField> $byName
+     */
+    private function validateFrenchPro(array $byName): void
+    {
+        if (isset($byName['siren'])) {
+            $siren = SiretValidator::normalize((string) $byName['siren']->getValue());
+            if ($siren !== '' && !SiretValidator::isSiren($siren)) {
+                $byName['siren']->addError($this->l('SIREN invalide : 9 chiffres attendus et clé de contrôle Luhn incorrecte.'));
+            }
+        }
+
+        $siretField = $byName['siret'] ?? null;
+        if ($siretField) {
+            $siret = SiretValidator::normalize((string) $siretField->getValue());
+            if ((bool) Configuration::get('SNT_IP_SIRET_REQUIRED') && $siret === '') {
+                $siretField->addError($this->l('Le SIRET est obligatoire pour un compte professionnel.'));
+            } elseif ($siret !== '' && !SiretValidator::isSiret($siret)) {
+                $siretField->addError($this->l('SIRET invalide : 14 chiffres attendus et clé de contrôle Luhn incorrecte.'));
+            }
+        }
+
+        if (isset($byName['phone'])) {
+            $phone = trim((string) $byName['phone']->getValue());
+            if ($phone === '') {
+                $byName['phone']->addError($this->l('Le téléphone est obligatoire pour un compte professionnel.'));
+            } elseif (!Validate::isPhoneNumber($phone)) {
+                $byName['phone']->addError($this->l('Numéro de téléphone invalide.'));
+            }
+        }
+
+        $vatField = $byName['vatNumber'] ?? null;
+        if ($vatField) {
+            $vat = VatValidator::normalize((string) $vatField->getValue());
+            if ($vat !== '' && !preg_match('/^[A-Z]{2}[A-Z0-9]{2,13}$/', $vat)) {
+                $vatField->addError($this->l('N° TVA intracommunautaire au format invalide.'));
+            }
+        }
+
+        // INSEE (company + adresse) puis VIES en complément (non bloquant en FR).
+        $this->applyInseeCheck($siretField, $byName['company'] ?? null, $vatField);
+        $this->applyViesCheck($vatField, $byName['company'] ?? null, 'FR', true);
+    }
+
+    /**
+     * Branche non-FR : la TVA est l'identifiant. Format (par pays) + VIES
+     * (bloquant si invalide). La raison sociale vient de VIES si disponible,
+     * sinon saisie manuelle obligatoire.
+     *
+     * @param array<string,FormField> $byName
+     */
+    private function validateForeignPro(array $byName, string $isoCountry): void
+    {
+        $vatField     = $byName['vatNumber'] ?? null;
+        $companyField = $byName['company'] ?? null;
+
+        if (!$vatField) {
+            return;
+        }
+
+        $raw = VatValidator::normalize((string) $vatField->getValue());
+        if ($raw === '') {
+            $vatField->addError($this->l('Le numéro de TVA intracommunautaire est obligatoire.'));
+            return;
+        }
+
+        [$cc, $num] = VatValidator::split($raw);
+        if (!VatValidator::isSupportedCountry($cc)) {
+            // Pas de préfixe pays reconnu : on préfixe avec le pays choisi.
+            $cc  = VatValidator::isoToViesCountry($isoCountry);
+            $num = $raw;
+        }
+        if (!VatValidator::isValidFormat($cc . $num)) {
+            $vatField->addError($this->l('Numéro de TVA au format invalide pour ce pays.'));
+            return;
+        }
+
+        // VIES (bloquant si invalide ; dégradation gracieuse si indisponible).
+        $this->applyViesCheck($vatField, $companyField, $isoCountry, false);
+
+        // Raison sociale : si VIES ne l'a pas fournie, saisie manuelle requise.
+        if ($companyField && trim((string) $companyField->getValue()) === '') {
+            $companyField->addError($this->l('La raison sociale est obligatoire (non fournie par VIES pour ce pays).'));
+        }
+    }
+
+    /**
+     * Vérification VIES d'un n° de TVA intracom. + décision :
+     *  - VALID     : (non-FR) raison sociale autoritative depuis VIES ;
+     *  - INVALID   : bloquant en non-FR, signalé (needs_review) en FR ;
+     *  - INDISPO   : strict -> bloquant ; sinon accepté + needs_review.
+     *
+     * Format -> cache -> appel VIES. Seuls les appels réellement émis sont
+     * journalisés (`vies_call`). Ne fait jamais confiance au blur.
+     */
+    private function applyViesCheck(?FormField $vatField, ?FormField $companyField, string $isoCountry, bool $isFr): void
+    {
+        if (!$vatField || !(bool) Configuration::get('SNT_IP_VIES_ENABLE')) {
+            return;
+        }
+        $raw = VatValidator::normalize((string) $vatField->getValue());
+        if ($raw === '') {
+            return; // FR : TVA optionnelle ; non-FR : l'obligation est gérée en amont
+        }
+
+        [$cc, $num] = VatValidator::split($raw);
+        if (!VatValidator::isSupportedCountry($cc)) {
+            $cc  = VatValidator::isoToViesCountry($isoCountry);
+            $num = $raw;
+        }
+        $full = $cc . $num;
+
+        if (!VatValidator::isValidFormat($full)) {
+            if (!$isFr) {
+                $vatField->addError($this->l('Numéro de TVA au format invalide.'));
+            }
+            return;
+        }
+
+        $strict = (bool) Configuration::get('SNT_IP_VIES_STRICT');
+
+        // Cache VIES (économie de quota + latence). Réutilise le résultat émis au
+        // blur ; sinon appel réel + mise en cache.
+        $cache  = new ViesCacheRepository();
+        $ttl    = (int) Configuration::get('SNT_IP_VIES_CACHE_TTL');
+        $cached = $cache->get($full, $ttl > 0 ? $ttl : 604800);
+
+        if ($cached !== null) {
+            $result = $cached['valid']
+                ? ViesResult::valid(['countryCode' => $cc, 'vatNumber' => $num, 'name' => $cached['name'], 'address' => $cached['address']])
+                : ViesResult::invalid($cc, $num);
+        } else {
+            $this->getLogger()->viesCall(Tools::getRemoteAddr(), $full);
+            $result = (new ViesClient())->checkVat($cc, $num);
+            if ($result->status === ViesResult::STATUS_VALID) {
+                $cache->put($full, true, $result->name, $result->address);
+            } elseif ($result->status === ViesResult::STATUS_INVALID) {
+                $cache->put($full, false, null, null);
+            } else {
+                $this->getLogger()->viesError($result->reason ?: $result->status, $full, Tools::getRemoteAddr());
+            }
+        }
+
+        switch ($result->status) {
+            case ViesResult::STATUS_VALID:
+                // Raison sociale autoritative depuis VIES (non-FR uniquement, et
+                // seulement si VIES la fournit — DE/ES la renvoient souvent vide).
+                if (!$isFr && $companyField && $result->hasName()) {
+                    $companyField->setValue((string) $result->name);
+                }
+                break;
+
+            case ViesResult::STATUS_INVALID:
+                if ($isFr) {
+                    // Entreprise réelle (INSEE) mais non assujettie intracom. :
+                    // on signale sans bloquer.
+                    $this->pendingNeedsReview = true;
+                } else {
+                    $vatField->addError($this->l('Ce numéro de TVA n\'est pas valide dans VIES.'));
+                }
+                break;
+
+            case ViesResult::STATUS_BAD_REQUEST:
+                if (!$isFr) {
+                    $vatField->addError($this->l('Numéro de TVA invalide.'));
+                }
+                break;
+
+            case ViesResult::STATUS_UNAVAILABLE:
+            case ViesResult::STATUS_RATE_LIMITED:
+            default:
+                if ($strict) {
+                    $vatField->addError($this->l('Service VIES momentanément indisponible, merci de réessayer.'));
+                } else {
+                    // Dégradation gracieuse : accepté, à vérifier.
+                    $this->pendingNeedsReview = true;
+                }
+                break;
+        }
     }
 
     /**
@@ -465,20 +690,40 @@ class Snt_Inscription_Pro extends Module
             return; // erreurs de format déjà remontées le cas échéant
         }
 
-        // Le n° de TVA se dérive du SIREN sans dépendre de l'INSEE : on peut le
-        // pré-remplir quel que soit l'état du service.
-        if ($vatField && trim((string) $vatField->getValue()) === '') {
-            $vatField->setValue((string) VatCalculator::fromSiret($siret));
-        }
-
+        // Le n° de TVA n'est PLUS auto-calculé depuis le SIREN : le calcul mod-97
+        // peut produire un numéro erroné (constaté en production). La valeur
+        // saisie par le client est conservée telle quelle ; sa validité sera
+        // confirmée par VIES (cf. vérification TVA intracom., Step 2).
         $strict = (bool) Configuration::get('SNT_IP_INSEE_STRICT');
 
-        // Journalise l'appel INSEE du chemin soumission (le chemin blur le fait
-        // déjà côté contrôleur), afin que le compteur `insee_call` du journal
-        // reflète TOUS les appels réellement émis à l'INSEE.
-        $this->getLogger()->inseeCall(Tools::getRemoteAddr(), $siret);
+        // Économie de quota INSEE : le blur (recherche par SIREN) a déjà mémorisé
+        // les établissements en cache serveur. Si le SIRET soumis y figure encore
+        // (dans le TTL), on réutilise cette donnée — émise côté serveur, donc
+        // autoritative — au lieu de rappeler l'INSEE. Sinon (saisie manuelle,
+        // cache expiré, édition sans blur), on interroge l'INSEE et on met le
+        // cache à jour. Seuls les appels réellement émis sont journalisés
+        // (`insee_call`), pour garder le compteur du journal exact.
+        $cache = new InseeCacheRepository();
+        $ttl   = (int) Configuration::get('SNT_IP_INSEE_CACHE_TTL');
+        $cached = $cache->get($siret, $ttl > 0 ? $ttl : 86400);
 
-        $result = (new InseeClient())->fetchSiret($siret);
+        if ($cached !== null) {
+            $result = InseeResult::found($cached);
+        } else {
+            $this->getLogger()->inseeCall(Tools::getRemoteAddr(), $siret);
+            $result = (new InseeClient())->fetchSiret($siret);
+            if ($result->status === InseeResult::STATUS_FOUND) {
+                $cache->put($siret, [
+                    'company'  => $result->company,
+                    'active'   => $result->active,
+                    'closed'   => $result->closed,
+                    'address1' => $result->address1,
+                    'address2' => $result->address2,
+                    'postcode' => $result->postcode,
+                    'city'     => $result->city,
+                ]);
+            }
+        }
 
         switch ($result->status) {
             case InseeResult::STATUS_FOUND:
@@ -669,6 +914,7 @@ class Snt_Inscription_Pro extends Module
             'SNT_IP_COMPANY_EDITABLE' => (bool) Configuration::get('SNT_IP_COMPANY_EDITABLE'),
             'SNT_IP_AFE_REGEX'        => (string) Configuration::get('SNT_IP_AFE_REGEX'),
             'SNT_IP_SIRET_REQUIRED'   => (bool) Configuration::get('SNT_IP_SIRET_REQUIRED'),
+            'SNT_IP_VIES_ENABLE'      => (bool) Configuration::get('SNT_IP_VIES_ENABLE'),
         ]);
 
         $this->context->controller->registerStylesheet(
@@ -726,10 +972,8 @@ class Snt_Inscription_Pro extends Module
             ? trim((string) Tools::getValue('accounting_email', ''))
             : (string) ($existing['accounting_email'] ?? '');
 
-        // Auto-calcul TVA si vide et SIREN dispo.
-        if ($vatNumber === '' && strlen($siret) >= 9) {
-            $vatNumber = (string) VatCalculator::fromSiret($siret);
-        }
+        // Pas d'auto-calcul de la TVA (le calcul mod-97 peut être erroné) : on
+        // conserve strictement la valeur saisie par le client (vide => NULL).
 
         // Écriture du SIRET sur le customer.
         if ($siret !== '' && $customer->siret !== $siret) {
@@ -796,22 +1040,69 @@ class Snt_Inscription_Pro extends Module
         // On ne conserve pas l'adresse au-delà de la persistance courante.
         $this->pendingInseeAddress = [];
 
-        if (empty($data['address1']) || empty($data['city']) || empty($data['postcode'])) {
-            return;
-        }
-
         $idCustomer = (int) $customer->id;
         if ($idCustomer <= 0) {
             return;
         }
 
+        // Pro non-FR (aucun SIRET) : pas d'adresse siège auto (VIES ne fournit pas
+        // d'adresse structurée) → saisie manuelle par le client. On sort sans bruit.
+        if (empty($data['address1']) && empty($customer->siret)) {
+            return;
+        }
+
+        // Filet anti-fragilité : `pendingInseeAddress` est porté d'un hook
+        // (validation) à l'autre (création) via une propriété d'instance, ce qui
+        // suppose que PrestaShop réutilise la même instance de module entre les
+        // deux — hypothèse qui n'est PAS garantie. Si l'état a été perdu, on
+        // relit l'adresse dans le cache INSEE persistant, par SIRET (source
+        // indépendante de la requête). C'est ce cache qui a alimenté le <select>
+        // d'établissements, il contient donc l'adresse de l'établissement choisi.
+        if (empty($data['address1']) || empty($data['city']) || empty($data['postcode'])) {
+            $siret = SiretValidator::normalize((string) $customer->siret);
+            if ($siret === '') {
+                $siret = SiretValidator::normalize((string) Tools::getValue('siret', ''));
+            }
+            $ttl    = (int) Configuration::get('SNT_IP_INSEE_CACHE_TTL');
+            $cached = $siret !== '' ? (new InseeCacheRepository())->get($siret, $ttl > 0 ? $ttl : 86400) : null;
+            if ($cached && !empty($cached['address1']) && !empty($cached['city']) && !empty($cached['postcode'])) {
+                $data = [
+                    'address1' => (string) $cached['address1'],
+                    'address2' => (string) ($cached['address2'] ?? ''),
+                    'postcode' => (string) $cached['postcode'],
+                    'city'     => (string) $cached['city'],
+                    'siren'    => $cached['siren'] ?? SiretValidator::extractSiren($siret),
+                ];
+            }
+        }
+
+        if (empty($data['address1']) || empty($data['city']) || empty($data['postcode'])) {
+            // Ni l'état inter-hook ni le cache n'ont fourni d'adresse exploitable.
+            $this->getLogger()->log(Logger::TYPE_ADDRESS_LOCKED, [
+                'severity'    => Logger::SEVERITY_INFO,
+                'id_customer' => $idCustomer,
+                'message'     => 'Adresse siège non créée : aucune adresse INSEE disponible (état perdu + cache vide)',
+            ]);
+            return;
+        }
+
         // Anti-doublon : ne rien créer si le client a déjà une adresse active.
         if ((int) Address::getFirstCustomerAddressId($idCustomer) > 0) {
+            $this->getLogger()->log(Logger::TYPE_ADDRESS_LOCKED, [
+                'severity'    => Logger::SEVERITY_INFO,
+                'id_customer' => $idCustomer,
+                'message'     => 'Adresse siège non créée : le client possède déjà une adresse',
+            ]);
             return;
         }
 
         $idCountry = (int) Country::getByIso('FR');
         if ($idCountry <= 0) {
+            $this->getLogger()->log(Logger::TYPE_ADDRESS_LOCKED, [
+                'severity'    => Logger::SEVERITY_WARNING,
+                'id_customer' => $idCustomer,
+                'message'     => 'Adresse siège non créée : pays FR non résolvable (Country::getByIso)',
+            ]);
             return;
         }
 
@@ -835,13 +1126,12 @@ class Snt_Inscription_Pro extends Module
                 $address->phone = $phone;
             }
 
-            // N° de TVA sur l'adresse (utile pour la facturation / mode B2B).
-            $siren = (string) ($data['siren'] ?? '');
-            if ($siren === '' && !empty($customer->siret)) {
-                $siren = SiretValidator::extractSiren((string) $customer->siret);
-            }
-            if ($siren !== '') {
-                $address->vat_number = (string) VatCalculator::fromSiret($siren);
+            // N° de TVA sur l'adresse : on reporte UNIQUEMENT la valeur saisie par
+            // le client (jamais un numéro calculé — le mod-97 peut être erroné).
+            // Vide si non renseignée ; VIES la validera (cf. vérification TVA).
+            $vatNumber = strtoupper(preg_replace('/\s+/', '', (string) Tools::getValue('vatNumber', '')));
+            if ($vatNumber !== '') {
+                $address->vat_number = $vatNumber;
             }
 
             if (!$address->validateFields(false) || !$address->validateFieldsLang(false)) {
@@ -909,22 +1199,70 @@ class Snt_Inscription_Pro extends Module
      */
     private function prefillFromCustomer(?Customer $customer): array
     {
-        $defaults = ['is_pro' => '0', 'siren' => '', 'siret' => '', 'company' => '', 'vatNumber' => '', 'afe' => '', 'accounting_email' => ''];
+        $defaults = ['is_pro' => '0', 'pro_country' => 'FR', 'siren' => '', 'siret' => '', 'company' => '', 'vatNumber' => '', 'afe' => '', 'accounting_email' => ''];
         if (!$customer instanceof Customer || (int) $customer->id <= 0) {
             return $defaults;
         }
         $row = $this->getRepository()->findByCustomer((int) $customer->id);
         $hasPro = !empty($customer->siret) || $row !== null;
         $siret  = (string) ($customer->siret ?? '');
+        $vatNumber = (string) ($row['vatNumber'] ?? '');
+
+        // Pays : FR si SIRET présent ; sinon déduit du préfixe TVA (EL->GR) ; FR par défaut.
+        $proCountry = 'FR';
+        if ($siret === '' && $vatNumber !== '') {
+            $prefix = strtoupper(substr(VatValidator::normalize($vatNumber), 0, 2));
+            if ($prefix === 'EL') {
+                $prefix = 'GR';
+            }
+            if ($prefix !== '' && $prefix !== 'FR' && VatValidator::isSupportedCountry(VatValidator::isoToViesCountry($prefix))) {
+                $proCountry = $prefix;
+            }
+        }
+
         return [
             'is_pro'           => $hasPro ? '1' : '0',
+            'pro_country'      => $proCountry,
             'siren'            => $siret !== '' ? SiretValidator::extractSiren($siret) : '',
             'siret'            => $siret,
             'company'          => (string) ($customer->company ?? ''),
-            'vatNumber'        => (string) ($row['vatNumber'] ?? ''),
+            'vatNumber'        => $vatNumber,
             'afe'              => (string) ($row['afe'] ?? ''),
             'accounting_email' => (string) ($row['accounting_email'] ?? ''),
         ];
+    }
+
+    /**
+     * Choix pays pour le sélecteur pro : UE-27 + Irlande du Nord (XI), libellés
+     * localisés. La valeur est le code ISO (FR, BE, DE, GR…) ; la Grèce est
+     * mappée EL->GR pour VIES au moment de la vérification. FR en tête.
+     *
+     * @return array<string,string>
+     */
+    private function euCountryChoices(): array
+    {
+        $idLang = (int) $this->context->language->id;
+        $names  = [];
+        foreach (Country::getCountries($idLang, false) as $c) {
+            $names[strtoupper((string) $c['iso_code'])] = (string) $c['name'];
+        }
+
+        $choices = [];
+        foreach (VatValidator::supportedCountries() as $viesCc) {
+            if ($viesCc === 'XI') {
+                $choices['XI'] = $this->l('Irlande du Nord');
+                continue;
+            }
+            $iso = $viesCc === 'EL' ? 'GR' : $viesCc;
+            $choices[$iso] = $names[$iso] ?? $iso;
+        }
+
+        // France en tête, le reste par ordre alphabétique.
+        $fr = ['FR' => $choices['FR'] ?? 'France'];
+        unset($choices['FR']);
+        asort($choices);
+
+        return $fr + $choices;
     }
 
     /**
@@ -958,6 +1296,11 @@ class Snt_Inscription_Pro extends Module
         if (Tools::isSubmit('snt_ip_purge_logs')) {
             $retention = (int) Configuration::get('SNT_IP_LOG_RETENTION_DAYS');
             $deleted   = $this->getLogger()->repository()->purgeOlderThan($retention > 0 ? $retention : 90);
+            // On profite de la purge pour vider aussi les caches INSEE et VIES périmés.
+            $ttl = (int) Configuration::get('SNT_IP_INSEE_CACHE_TTL');
+            (new InseeCacheRepository())->purgeOlderThan($ttl > 0 ? $ttl : 86400);
+            $viesTtl = (int) Configuration::get('SNT_IP_VIES_CACHE_TTL');
+            (new ViesCacheRepository())->purgeOlderThan($viesTtl > 0 ? $viesTtl : 604800);
             $output   .= $this->displayConfirmation(sprintf($this->l('%d ligne(s) de log purgée(s).'), $deleted));
         }
 
@@ -1079,7 +1422,7 @@ class Snt_Inscription_Pro extends Module
             Logger::TYPE_ACCOUNT_CREATED, Logger::TYPE_ACCOUNT_DEGRADED,
             Logger::TYPE_INSEE_CALL, Logger::TYPE_INSEE_ERROR,
             Logger::TYPE_API_ACCESS, Logger::TYPE_RATE_LIMITED, Logger::TYPE_ALERT_MAIL,
-            Logger::TYPE_ADDRESS_LOCKED,
+            Logger::TYPE_ADDRESS_LOCKED, Logger::TYPE_VIES_CALL, Logger::TYPE_VIES_ERROR,
         ];
         if ($type !== '' && !in_array($type, $types, true)) {
             $type = '';
@@ -1180,10 +1523,15 @@ class Snt_Inscription_Pro extends Module
                     ['type' => 'text', 'label' => $this->l('Rate-limit : fenêtre (s)'),        'name' => 'SNT_IP_RATELIMIT_WINDOW', 'size' => 5],
                     ['type' => 'text', 'label' => $this->l('Rétention des logs (jours)'),      'name' => 'SNT_IP_LOG_RETENTION_DAYS', 'size' => 5],
                     ['type' => 'text', 'label' => $this->l('Anti-flood alertes mail (s)'),     'name' => 'SNT_IP_ALERT_THROTTLE', 'size' => 6],
+                    ['type' => 'text', 'label' => $this->l('Cache INSEE : durée de vie (s)'),  'name' => 'SNT_IP_INSEE_CACHE_TTL', 'size' => 6],
+                    ['type' => 'text', 'label' => $this->l('Timeout VIES (s)'),               'name' => 'SNT_IP_VIES_TIMEOUT', 'size' => 5],
+                    ['type' => 'text', 'label' => $this->l('Cache VIES : durée de vie (s)'),   'name' => 'SNT_IP_VIES_CACHE_TTL', 'size' => 7],
                     $this->switchInput('SNT_IP_SIRET_REQUIRED',     $this->l('SIRET obligatoire si professionnel')),
                     $this->switchInput('SNT_IP_WRITE_COMPANY',      $this->l('Écrire la raison sociale depuis INSEE')),
                     $this->switchInput('SNT_IP_COMPANY_EDITABLE',   $this->l('Autoriser l\'édition libre de la raison sociale')),
                     $this->switchInput('SNT_IP_INSEE_STRICT',       $this->l('Mode strict INSEE (bloquer si injoignable)')),
+                    $this->switchInput('SNT_IP_VIES_ENABLE',        $this->l('Activer la vérification VIES de la TVA')),
+                    $this->switchInput('SNT_IP_VIES_STRICT',        $this->l('Mode strict VIES (bloquer si injoignable)')),
                     $this->switchInput('SNT_IP_PURGE_ON_DOWNGRADE', $this->l('Purger les données pro si le client repasse particulier')),
                 ],
                 'submit' => ['title' => $this->l('Enregistrer')],
