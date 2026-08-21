@@ -1,10 +1,11 @@
 /**
- * SNT Inscription Pro — front logic (Phase 2).
+ * SNT Inscription Pro — front logic.
  *  - Réordonne le DOM : is_pro + champs pro tout en haut du bloc formulaire.
  *  - Toggle show/hide selon `is_pro` + gestion `required` dynamique.
- *  - Validation SIRET au blur : Luhn local puis appel AJAX INSEE.
- *  - Autofill company + vatNumber depuis la réponse INSEE.
- *  - Bouton « Utiliser mon SIREN » à côté du champ AFE.
+ *  - Parcours SIREN : saisie du SIREN → appel AJAX INSEE → <select> des
+ *    établissements → la sélection renseigne le champ `siret` (autoritatif),
+ *    la raison sociale et le n° de TVA.
+ *  - Fallback saisie manuelle du SIRET quand l'INSEE est indisponible.
  *  - Rend `company` readonly quand SNT_IP_COMPANY_EDITABLE = false.
  */
 (function () {
@@ -14,16 +15,36 @@
         window.console.debug('[SNT-IP] registration.js loaded');
     }
 
-    var PRO_FIELDS = ['siret', 'company', 'vatNumber', 'afe'];
+    // `siren` (nouveau) + `siret` (autoritatif, alimenté par la sélection) +
+    // company/vatNumber + phone (création only) + accounting_email.
+    var PRO_FIELDS = ['siren', 'siret', 'company', 'vatNumber', 'phone', 'accounting_email'];
 
     var CFG = {
         validateUrl:     window.SNT_IP_VALIDATE_URL || '',
         companyEditable: !!window.SNT_IP_COMPANY_EDITABLE,
-        afeRegex:        window.SNT_IP_AFE_REGEX || '',
         siretRequired:   !!window.SNT_IP_SIRET_REQUIRED,
     };
 
     var LUHN_EXCEPTIONS_SIREN = ['356000000']; // La Poste
+
+    // Au-delà de ce nombre d'établissements, on affiche un champ de recherche
+    // pour filtrer le <select> (SIREN à établissements très nombreux).
+    var FILTER_THRESHOLD = 50;
+
+    // Modes d'affichage du champ SIRET :
+    //  - 'hidden'   : masqué, renseigné par la sélection d'établissement (création).
+    //  - 'readonly' : visible en lecture seule (édition : montre l'établissement courant).
+    //  - 'manual'   : visible et éditable (fallback INSEE indisponible).
+    var siretMode = 'hidden';
+
+    // Dernière liste d'établissements reçue (pour le filtrage).
+    var establishmentsData = [];
+
+    // Dernier SIREN pour lequel un appel a déjà été lancé : évite les appels
+    // INSEE redondants si le `blur` se redéclenche sur la même valeur (focus qui
+    // rebondit, autofill, réordonnancement DOM). Réinitialisé dès que le champ
+    // SIREN est réédité (listener `input`).
+    var lastSearchedSiren = '';
 
     // ------------------------------------------------------------------
     // Utilitaires DOM
@@ -38,7 +59,6 @@
     }
 
     function fieldByName(name) {
-        // Après removeDuplicateFields(), il ne doit rester que le nôtre.
         return document.querySelector('[name="' + name + '"]');
     }
 
@@ -47,11 +67,6 @@
         return input.closest('.form-group') || input.parentElement;
     }
 
-    /**
-     * Container direct de l'input (sur PS classic, typiquement un `.col-md-*`
-     * frère du label). C'est là qu'on veut coller les éléments qui doivent
-     * apparaître sous l'input (statut, boutons).
-     */
     function inlineContainerOf(input) {
         if (!input) return null;
         return input.parentElement || wrapperOf(input);
@@ -91,11 +106,9 @@
     }
 
     /**
-     * Supprime les inputs siret/company/vatNumber/afe hardcodés par le thème
-     * (customer-form.tpl custom) en gardant uniquement ceux injectés par notre
-     * hook `additionalCustomerFormFields`. On identifie les nôtres par le fait
-     * qu'ils partagent le même parent direct que le radio `is_pro` — qui n'est
-     * jamais présent dans un thème natif.
+     * Supprime les inputs pro hardcodés par le thème en gardant uniquement ceux
+     * injectés par notre hook. On identifie les nôtres par le fait qu'ils
+     * partagent le même parent direct que le radio `is_pro`.
      */
     function removeDuplicateFields() {
         var toggle = toggleGroup();
@@ -109,8 +122,6 @@
             Array.prototype.forEach.call(inputs, function (input) {
                 var wrapper = wrapperOf(input);
                 if (!wrapper) return;
-                // Si ce wrapper n'est pas un enfant direct du parent commun,
-                // c'est un doublon (hardcodé thème) → on le retire.
                 if (wrapper.parentElement !== parent && wrapper.parentNode) {
                     wrapper.parentNode.removeChild(wrapper);
                 }
@@ -158,10 +169,45 @@
                 }
             });
         });
+        if (show) {
+            // Le SIRET a une visibilité propre (piloté par la sélection).
+            syncSiretVisibility();
+        }
     }
 
     // ------------------------------------------------------------------
-    // Validation SIRET (Luhn local + AJAX INSEE)
+    // Gestion du champ SIRET (hidden / readonly / manual)
+    // ------------------------------------------------------------------
+
+    function setSiretMode(mode) {
+        siretMode = mode;
+        syncSiretVisibility();
+    }
+
+    function syncSiretVisibility() {
+        var input = fieldByName('siret');
+        var wrapper = wrapperOf(input);
+        if (!input || !wrapper) return;
+
+        if (!isProChecked()) {
+            // Laissé à applyVisibility (masqué).
+            return;
+        }
+
+        if (siretMode === 'hidden') {
+            wrapper.style.display = 'none';
+            input.setAttribute('readonly', 'readonly');
+        } else if (siretMode === 'readonly') {
+            wrapper.style.display = '';
+            input.setAttribute('readonly', 'readonly');
+        } else { // manual
+            wrapper.style.display = '';
+            input.removeAttribute('readonly');
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Validation locale (Luhn)
     // ------------------------------------------------------------------
 
     function normalize(v) {
@@ -182,6 +228,12 @@
         return sum % 10 === 0;
     }
 
+    function isValidSirenLocal(siren) {
+        if (siren.length !== 9) return false;
+        if (LUHN_EXCEPTIONS_SIREN.indexOf(siren) !== -1) return true;
+        return luhnCheck(siren);
+    }
+
     function isValidSiretLocal(siret) {
         if (siret.length !== 14) return false;
         var siren = siret.substring(0, 9);
@@ -191,18 +243,22 @@
         return luhnCheck(siret);
     }
 
-    function computeVatFr(siret) {
-        var siren = parseInt(siret.substring(0, 9), 10);
-        if (isNaN(siren)) return '';
-        var key = (12 + 3 * (siren % 97)) % 97;
+    function computeVatFrFromSiren(siren) {
+        var s = parseInt(siren.substring(0, 9), 10);
+        if (isNaN(s)) return '';
+        var key = (12 + 3 * (s % 97)) % 97;
         var padded = key < 10 ? '0' + key : String(key);
-        return 'FR' + padded + siret.substring(0, 9);
+        return 'FR' + padded + siren.substring(0, 9);
     }
 
+    // ------------------------------------------------------------------
+    // Statut (sous le champ SIREN)
+    // ------------------------------------------------------------------
+
     function ensureStatusEl() {
-        var siretInput = fieldByName('siret');
-        if (!siretInput) return null;
-        var container = inlineContainerOf(siretInput);
+        var sirenInput = fieldByName('siren');
+        if (!sirenInput) return null;
+        var container = inlineContainerOf(sirenInput);
         if (!container) return null;
         var el = container.querySelector('.snt-ip-status');
         if (!el) {
@@ -233,61 +289,201 @@
         }
     }
 
-    function handleValidateResponse(data, localSiret) {
-        var companyInput = fieldByName('company');
-        var vatInput     = fieldByName('vatNumber');
+    // ------------------------------------------------------------------
+    // <select> des établissements
+    // ------------------------------------------------------------------
 
-        switch (data && data.status) {
-            case 'ok':
-                var label = data.company ? ('✓ ' + data.company) : '✓ SIRET vérifié';
-                if (data.closed) label += ' (établissement fermé à l\'INSEE)';
-                setStatus(data.closed ? 'pending' : 'ok', label);
-                if (data.company) {
-                    if (CFG.companyEditable) {
-                        fillIfEmpty(companyInput, data.company);
-                    } else {
-                        forceFill(companyInput, data.company);
-                    }
-                }
-                fillIfEmpty(vatInput, data.vat || computeVatFr(localSiret));
-                break;
+    function ensureEtabUI() {
+        var sirenInput = fieldByName('siren');
+        if (!sirenInput) return null;
+        var container = inlineContainerOf(sirenInput);
+        if (!container) return null;
 
-            case 'not_found':
-                setStatus('error', 'SIRET inconnu à l\'INSEE.');
-                break;
+        var block = container.querySelector('.snt-ip-etab');
+        if (block) return block;
 
-            case 'degraded':
-                setStatus('pending', 'INSEE indisponible — saisissez votre raison sociale, elle sera vérifiée par nos équipes.');
-                unlockCompanyForManual();
-                fillIfEmpty(vatInput, data.vat || computeVatFr(localSiret));
-                break;
+        block = document.createElement('div');
+        block.className = 'snt-ip-etab';
 
-            case 'invalid_format':
-                setStatus('error', 'SIRET invalide.');
-                break;
+        var filter = document.createElement('input');
+        filter.type = 'text';
+        filter.className = 'snt-ip-etab-filter form-control';
+        filter.placeholder = 'Filtrer les établissements…';
+        filter.style.display = 'none';
+        filter.style.marginBottom = '6px';
+        filter.addEventListener('input', function () {
+            renderOptions(filterList(establishmentsData, filter.value));
+        });
 
-            case 'rate_limited':
-                setStatus('error', 'Trop de tentatives, merci de patienter quelques instants.');
-                break;
+        var label = document.createElement('label');
+        label.className = 'snt-ip-etab-label';
+        label.textContent = 'Établissement';
 
-            case 'unavailable':
-                // Service momentanément indisponible : on autorise la saisie
-                // manuelle de la raison sociale plutôt que de bloquer le client.
-                setStatus('pending', 'Vérification INSEE indisponible — saisissez votre raison sociale, elle sera vérifiée par nos équipes.');
-                unlockCompanyForManual();
-                fillIfEmpty(vatInput, data.vat || computeVatFr(localSiret));
-                break;
+        var select = document.createElement('select');
+        select.className = 'snt-ip-etab-select form-control';
+        select.addEventListener('change', function () {
+            var item = findBySiret(establishmentsData, select.value);
+            applyEstablishmentSelection(item);
+        });
 
-            default:
-                setStatus('error', 'Impossible de vérifier le SIRET.');
+        block.appendChild(label);
+        block.appendChild(filter);
+        block.appendChild(select);
+        container.appendChild(block);
+        return block;
+    }
+
+    function getEtabSelect() {
+        var block = ensureEtabUI();
+        return block ? block.querySelector('.snt-ip-etab-select') : null;
+    }
+
+    function getEtabFilter() {
+        var block = ensureEtabUI();
+        return block ? block.querySelector('.snt-ip-etab-filter') : null;
+    }
+
+    function showEtabUI(show) {
+        var block = ensureEtabUI();
+        if (block) block.style.display = show ? '' : 'none';
+    }
+
+    function findBySiret(list, siret) {
+        for (var i = 0; i < list.length; i++) {
+            if (String(list[i].siret) === String(siret)) return list[i];
+        }
+        return null;
+    }
+
+    function filterList(list, term) {
+        term = String(term || '').toLowerCase().replace(/\s+/g, '');
+        if (term === '') return list;
+        return list.filter(function (it) {
+            var hay = (String(it.siret || '') + ' ' + establishmentLabel(it)).toLowerCase().replace(/\s+/g, '');
+            return hay.indexOf(term) !== -1;
+        });
+    }
+
+    function establishmentAddress(it) {
+        var parts = [];
+        if (it.address1) parts.push(it.address1);
+        var cp = [it.postcode, it.city].filter(Boolean).join(' ');
+        if (cp) parts.push(cp);
+        return parts.join(', ');
+    }
+
+    function establishmentLabel(it) {
+        var siret = String(it.siret || '');
+        var pretty = siret.replace(/(\d{3})(\d{3})(\d{3})(\d{5})/, '$1 $2 $3 $4');
+        var label = pretty;
+        var addr = establishmentAddress(it);
+        if (addr) label += ' — ' + addr;
+        if (it.siege) label += ' (siège)';
+        if (it.closed) label += ' (fermé)';
+        return label;
+    }
+
+    function renderOptions(list) {
+        var select = getEtabSelect();
+        if (!select) return;
+        var previous = select.value;
+        select.innerHTML = '';
+
+        if (!list.length) {
+            var empty = document.createElement('option');
+            empty.value = '';
+            empty.textContent = 'Aucun établissement';
+            select.appendChild(empty);
+            return;
+        }
+
+        list.forEach(function (it) {
+            var opt = document.createElement('option');
+            opt.value = String(it.siret || '');
+            opt.textContent = establishmentLabel(it);
+            select.appendChild(opt);
+        });
+
+        // Conserver la sélection précédente si toujours présente.
+        if (previous && findBySiret(list, previous)) {
+            select.value = previous;
         }
     }
 
     /**
-     * Fallback : quand l'INSEE ne peut confirmer le SIRET, on rend `company`
-     * éditable (même si SNT_IP_COMPANY_EDITABLE=false) pour ne pas bloquer
-     * l'inscription. Le serveur marque alors le compte « à vérifier ».
+     * Alimente le <select> puis pré-sélectionne le meilleur établissement :
+     * le SIRET courant (édition) s'il est présent, sinon le premier (déjà trié
+     * côté serveur : siège en tête).
      */
+    function renderEstablishments(list) {
+        establishmentsData = list || [];
+        var filter = getEtabFilter();
+        if (filter) {
+            filter.value = '';
+            filter.style.display = establishmentsData.length > FILTER_THRESHOLD ? '' : 'none';
+        }
+        renderOptions(establishmentsData);
+
+        var select = getEtabSelect();
+        if (!select) return;
+
+        var currentSiret = normalize((fieldByName('siret') || {}).value || '');
+        var preselect = (currentSiret && findBySiret(establishmentsData, currentSiret))
+            ? currentSiret
+            : (establishmentsData[0] ? establishmentsData[0].siret : '');
+
+        if (preselect) {
+            select.value = String(preselect);
+            applyEstablishmentSelection(findBySiret(establishmentsData, preselect));
+        }
+        showEtabUI(true);
+    }
+
+    function applyEstablishmentSelection(item) {
+        if (!item) return;
+        var siretInput   = fieldByName('siret');
+        var companyInput = fieldByName('company');
+        var vatInput     = fieldByName('vatNumber');
+
+        if (siretInput) {
+            siretInput.value = String(item.siret || '');
+        }
+
+        if (item.company) {
+            if (CFG.companyEditable) {
+                fillIfEmpty(companyInput, item.company);
+            } else {
+                forceFill(companyInput, item.company);
+            }
+        }
+
+        var vat = computeVatFrFromSiren(String(item.siret || '').substring(0, 9));
+        fillIfEmpty(vatInput, vat);
+
+        var msg = '✓ ' + (item.company || 'Établissement sélectionné');
+        if (item.closed) msg += ' (établissement fermé à l\'INSEE)';
+        var addr = establishmentAddress(item);
+        if (addr) msg += ' — ' + addr;
+        setStatus(item.closed ? 'pending' : 'ok', msg);
+    }
+
+    // ------------------------------------------------------------------
+    // Fallback saisie manuelle (INSEE indisponible)
+    // ------------------------------------------------------------------
+
+    function enterManualMode(vat) {
+        establishmentsData = [];
+        showEtabUI(false);
+        setSiretMode('manual');
+        unlockCompanyForManual();
+        fillIfEmpty(fieldByName('vatNumber'), vat || '');
+        var siretInput = fieldByName('siret');
+        if (siretInput) {
+            siretInput.setAttribute('required', 'required');
+            siretInput.dataset.sntIpRequired = '1';
+        }
+    }
+
     function unlockCompanyForManual() {
         var input = fieldByName('company');
         if (!input) return;
@@ -296,13 +492,64 @@
         input.classList.add('snt-ip-manual');
     }
 
-    function callValidate(siret) {
+    // ------------------------------------------------------------------
+    // Appel AJAX (SIREN → établissements)
+    // ------------------------------------------------------------------
+
+    function handleSearchResponse(data, siren) {
+        switch (data && data.status) {
+            case 'ok':
+                setStatus('ok', (data.company ? '✓ ' + data.company : '✓ Entreprise trouvée')
+                    + ' — ' + (data.total || (data.establishments || []).length) + ' établissement(s)'
+                    + (data.truncated ? ' (liste tronquée)' : ''));
+                if (data.company) {
+                    var companyInput = fieldByName('company');
+                    if (CFG.companyEditable) {
+                        fillIfEmpty(companyInput, data.company);
+                    } else {
+                        forceFill(companyInput, data.company);
+                    }
+                }
+                fillIfEmpty(fieldByName('vatNumber'), data.vat || computeVatFrFromSiren(siren));
+                setSiretMode('hidden');
+                renderEstablishments(data.establishments || []);
+                break;
+
+            case 'not_found':
+                showEtabUI(false);
+                setStatus('error', 'SIREN inconnu à l\'INSEE.');
+                break;
+
+            case 'degraded':
+            case 'unavailable':
+                setStatus('pending', 'Vérification INSEE indisponible — saisissez votre SIRET et votre raison sociale, ils seront vérifiés par nos équipes.');
+                enterManualMode(data.vat || computeVatFrFromSiren(siren));
+                break;
+
+            case 'invalid_format':
+                showEtabUI(false);
+                setStatus('error', 'SIREN invalide.');
+                break;
+
+            case 'rate_limited':
+                setStatus('error', 'Trop de tentatives, merci de patienter quelques instants.');
+                break;
+
+            default:
+                setStatus('error', 'Impossible de vérifier le SIREN.');
+        }
+    }
+
+    function callSearch(siren) {
+        // Mémorise l'appel en cours/effectué pour cette valeur : toute
+        // répétition du blur sur le même SIREN sera ignorée (cf. onSirenBlur).
+        lastSearchedSiren = siren;
         if (!CFG.validateUrl) {
-            setStatus('pending', 'SIRET localement valide (INSEE non configuré).');
-            fillIfEmpty(fieldByName('vatNumber'), computeVatFr(siret));
+            setStatus('pending', 'SIREN localement valide (INSEE non configuré) — saisissez votre SIRET.');
+            enterManualMode(computeVatFrFromSiren(siren));
             return;
         }
-        setStatus('pending', 'Vérification INSEE…');
+        setStatus('pending', 'Recherche des établissements…');
         var xhr = new XMLHttpRequest();
         xhr.open('POST', CFG.validateUrl, true);
         xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
@@ -314,51 +561,48 @@
                 setStatus('error', 'Réponse serveur invalide.');
                 return;
             }
-            handleValidateResponse(data, siret);
+            handleSearchResponse(data, siren);
         };
         xhr.onerror = function () { setStatus('error', 'Erreur réseau.'); };
-        xhr.send('siret=' + encodeURIComponent(siret) + '&ajax=1');
+        xhr.send('siren=' + encodeURIComponent(siren) + '&ajax=1');
     }
 
-    function onSiretBlur() {
-        var input = fieldByName('siret');
+    function onSirenBlur() {
+        var input = fieldByName('siren');
         if (!input) return;
-        var siret = normalize(input.value);
-        if (siret === '') {
+        var siren = normalize(input.value);
+        if (siren === '') {
             setStatus('', '');
             return;
         }
+        if (!isValidSirenLocal(siren)) {
+            setStatus('error', 'SIREN invalide (9 chiffres, clé Luhn).');
+            return;
+        }
+        input.value = siren;
+        if (siren === lastSearchedSiren) {
+            // Déjà interrogé pour cette valeur : pas de nouvel appel INSEE.
+            return;
+        }
+        callSearch(siren);
+    }
+
+    /**
+     * Blur SIRET en mode fallback manuel : validation locale + calcul TVA, sans
+     * appel INSEE (indisponible). La re-vérif serveur au submit fera foi.
+     */
+    function onSiretManualBlur() {
+        if (siretMode !== 'manual') return;
+        var input = fieldByName('siret');
+        if (!input) return;
+        var siret = normalize(input.value);
+        if (siret === '') return;
         if (!isValidSiretLocal(siret)) {
             setStatus('error', 'SIRET invalide (14 chiffres, clé Luhn).');
             return;
         }
         input.value = siret;
-        callValidate(siret);
-    }
-
-    // ------------------------------------------------------------------
-    // Bouton « Utiliser mon SIREN » pour l'AFE
-    // ------------------------------------------------------------------
-
-    function injectAfeSirenButton() {
-        var afeInput   = fieldByName('afe');
-        var siretInput = fieldByName('siret');
-        if (!afeInput || !siretInput) return;
-        var container = inlineContainerOf(afeInput);
-        if (!container || container.querySelector('.snt-ip-btn-siren')) return;
-
-        var btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'btn btn-outline-secondary btn-sm snt-ip-btn-siren';
-        btn.textContent = 'Utiliser mon SIREN';
-        btn.addEventListener('click', function () {
-            var siren = normalize(siretInput.value).substring(0, 9);
-            if (siren.length === 9) {
-                afeInput.value = siren;
-                afeInput.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-        });
-        container.appendChild(btn);
+        fillIfEmpty(fieldByName('vatNumber'), computeVatFrFromSiren(siret.substring(0, 9)));
     }
 
     // ------------------------------------------------------------------
@@ -384,16 +628,28 @@
         removeDuplicateFields();
         reorderFields();
         applyCompanyReadonly();
-        injectAfeSirenButton();
+
+        // État initial du SIRET : édition (valeur existante) → lecture seule
+        // visible ; création → masqué (piloté par la sélection).
+        var existingSiret = normalize((fieldByName('siret') || {}).value || '');
+        setSiretMode(existingSiret !== '' ? 'readonly' : 'hidden');
+
         applyVisibility(isProChecked());
 
         radios.forEach(function (r) {
             r.addEventListener('change', function () { applyVisibility(isProChecked()); });
         });
 
+        var sirenInput = fieldByName('siren');
+        if (sirenInput) {
+            sirenInput.addEventListener('blur', onSirenBlur);
+            // Toute édition du SIREN réarme la recherche (permet un nouvel essai,
+            // ex. après un rate-limit, ou pour corriger une saisie).
+            sirenInput.addEventListener('input', function () { lastSearchedSiren = ''; });
+        }
         var siretInput = fieldByName('siret');
         if (siretInput) {
-            siretInput.addEventListener('blur', onSiretBlur);
+            siretInput.addEventListener('blur', onSiretManualBlur);
         }
     });
 })();

@@ -47,6 +47,8 @@ class Snt_Inscription_Pro extends Module
         'actionCustomerAccountUpdate',
         'actionObjectCustomerDeleteAfter',
         'actionFrontControllerSetMedia',
+        'actionObjectAddressUpdateBefore',
+        'actionObjectAddressDeleteBefore',
     ];
 
     private ?ProCustomerRepository $repository = null;
@@ -60,11 +62,21 @@ class Snt_Inscription_Pro extends Module
      */
     private bool $pendingNeedsReview = false;
 
+    /**
+     * Porté de la même façon : adresse de l'établissement renvoyée par l'INSEE
+     * (STATUS_FOUND avec composants exploitables). Consommée par
+     * `hookActionCustomerAccountAdd` pour créer d'office l'adresse « siège social »
+     * du client pro. Vide si l'INSEE n'a pas confirmé ou n'a pas fourni d'adresse.
+     *
+     * @var array{address1:string, address2:string, postcode:string, city:string, siren:?string}|array{}
+     */
+    private array $pendingInseeAddress = [];
+
     public function __construct()
     {
         $this->name          = 'snt_inscription_pro';
         $this->tab           = 'front_office_features';
-        $this->version       = '1.1.0';
+        $this->version       = '1.3.0';
         $this->author        = 'SNT2';
         $this->need_instance = 0;
         $this->bootstrap     = true;
@@ -154,6 +166,8 @@ class Snt_Inscription_Pro extends Module
             `id_customer`            INT(11) UNSIGNED NOT NULL,
             `vatNumber`              VARCHAR(20)  DEFAULT NULL,
             `afe`                    VARCHAR(34)  DEFAULT NULL,
+            `accounting_email`       VARCHAR(255) DEFAULT NULL,
+            `locked_address_id`      INT(11) UNSIGNED DEFAULT NULL,
             `needs_review`           TINYINT(1)   NOT NULL DEFAULT 0,
             `date_add`               DATETIME     NOT NULL,
             `date_upd`               DATETIME     NOT NULL,
@@ -259,7 +273,21 @@ class Snt_Inscription_Pro extends Module
             ])
             ->setRequired(true);
 
+        // siren : saisi par le client (9 chiffres). Au blur, le JS interroge
+        // l'INSEE et alimente un <select> d'établissements ; la sélection écrit
+        // le SIRET complet dans le champ `siret`. Non requis côté serveur (la
+        // valeur autoritative reste `siret`) pour préserver le fallback manuel
+        // en cas d'INSEE indisponible ; le JS le rend requis dans le flux normal.
+        $additions[] = (new FormField())
+            ->setName('siren')
+            ->setType('text')
+            ->setLabel($this->l('SIREN'))
+            ->setValue($prefill['siren'])
+            ->setRequired(false);
+
         // siret : réutilise le field existant si présent, sinon on l'ajoute.
+        // Renseigné par la sélection d'établissement (JS) ou en saisie manuelle
+        // dans le fallback. Reste la valeur autoritative re-vérifiée par l'INSEE.
         if (isset($existingByName['siret'])) {
             if ($prefill['siret'] !== '') {
                 $existingByName['siret']->setValue($prefill['siret']);
@@ -301,12 +329,32 @@ class Snt_Inscription_Pro extends Module
                 ->setValue($prefill['vatNumber']);
         }
 
-        // afe : toujours ajouté (n'existe pas dans les fields natifs PS).
+        // afe : plus demandée au moment de la création/édition du compte. Elle
+        // est désormais rattachée à l'adresse de facturation (cf. formulaire
+        // d'adresse). La colonne DB / l'endpoint / le BO restent inchangés pour
+        // ne pas perdre les données déjà saisies.
+
+        // téléphone : obligatoire pour créer l'adresse « siège social » (une
+        // adresse PS doit porter un téléphone). Uniquement à la CRÉATION du
+        // compte — à l'édition, l'adresse existe déjà (et sera verrouillée).
+        // Non persisté en table module : consommé une seule fois pour l'adresse.
+        if (!$this->isEditingExistingCustomer()) {
+            $additions[] = (new FormField())
+                ->setName('phone')
+                ->setType('text')
+                ->setLabel($this->l('Téléphone'))
+                ->setValue('')
+                ->setRequired(true);
+        }
+
+        // email comptable : demandé par le service comptabilité. Persisté en
+        // table module et exposé à l'ERP via l'endpoint API.
         $additions[] = (new FormField())
-            ->setName('afe')
+            ->setName('accounting_email')
             ->setType('text')
-            ->setLabel($this->l('Adresse de Facturation Électronique (AFE)'))
-            ->setValue($prefill['afe']);
+            ->setLabel($this->l('Email comptable'))
+            ->setValue($prefill['accounting_email'])
+            ->setRequired(true);
 
         return $additions;
     }
@@ -321,8 +369,9 @@ class Snt_Inscription_Pro extends Module
         $fields = $params['fields'] ?? [];
         $errors = [];
 
-        // Remise à zéro pour cette requête : sera positionné par applyInseeCheck.
-        $this->pendingNeedsReview = false;
+        // Remise à zéro pour cette requête : positionnés par applyInseeCheck.
+        $this->pendingNeedsReview  = false;
+        $this->pendingInseeAddress = [];
 
         $isPro = $this->extractFieldValue($fields, 'is_pro') === '1';
 
@@ -336,6 +385,15 @@ class Snt_Inscription_Pro extends Module
 
         foreach ($fields as $field) {
             switch ($field->getName()) {
+                case 'siren':
+                    // Non requis (la valeur autoritative est le SIRET) mais si
+                    // renseigné, on vérifie le format 9 chiffres + Luhn.
+                    $siren = SiretValidator::normalize((string) $field->getValue());
+                    if ($siren !== '' && !SiretValidator::isSiren($siren)) {
+                        $field->addError($this->l('SIREN invalide : 9 chiffres attendus et clé de contrôle Luhn incorrecte.'));
+                    }
+                    break;
+
                 case 'siret':
                     $siretField = $field;
                     $siret = SiretValidator::normalize((string) $field->getValue());
@@ -350,19 +408,31 @@ class Snt_Inscription_Pro extends Module
                     $companyField = $field;
                     break;
 
-                case 'afe':
-                    $afe   = trim((string) $field->getValue());
-                    $regex = (string) Configuration::get('SNT_IP_AFE_REGEX');
-                    if ($afe !== '' && $regex !== '' && @preg_match('/' . $regex . '/', $afe) !== 1) {
-                        $field->addError($this->l('AFE au format invalide.'));
-                    }
-                    break;
-
                 case 'vatNumber':
                     $vatField = $field;
                     $vat = strtoupper(preg_replace('/\s+/', '', (string) $field->getValue()));
                     if ($vat !== '' && !preg_match('/^[A-Z]{2}[A-Z0-9]{2,13}$/', $vat)) {
                         $field->addError($this->l('N° TVA intracommunautaire au format invalide.'));
+                    }
+                    break;
+
+                case 'phone':
+                    // Injecté uniquement à la création (cf. formulaire) : requis
+                    // pour l'adresse « siège social ».
+                    $phone = trim((string) $field->getValue());
+                    if ($phone === '') {
+                        $field->addError($this->l('Le téléphone est obligatoire pour un compte professionnel.'));
+                    } elseif (!Validate::isPhoneNumber($phone)) {
+                        $field->addError($this->l('Numéro de téléphone invalide.'));
+                    }
+                    break;
+
+                case 'accounting_email':
+                    $accEmail = trim((string) $field->getValue());
+                    if ($accEmail === '') {
+                        $field->addError($this->l('L\'email comptable est obligatoire pour un compte professionnel.'));
+                    } elseif (!Validate::isEmail($accEmail)) {
+                        $field->addError($this->l('Email comptable invalide.'));
                     }
                     break;
             }
@@ -402,6 +472,12 @@ class Snt_Inscription_Pro extends Module
         }
 
         $strict = (bool) Configuration::get('SNT_IP_INSEE_STRICT');
+
+        // Journalise l'appel INSEE du chemin soumission (le chemin blur le fait
+        // déjà côté contrôleur), afin que le compteur `insee_call` du journal
+        // reflète TOUS les appels réellement émis à l'INSEE.
+        $this->getLogger()->inseeCall(Tools::getRemoteAddr(), $siret);
+
         $result = (new InseeClient())->fetchSiret($siret);
 
         switch ($result->status) {
@@ -413,6 +489,17 @@ class Snt_Inscription_Pro extends Module
                     // Pas d'écriture INSEE mais édition libre interdite : on
                     // verrouille sur la valeur en base pour empêcher la fraude.
                     $companyField->setValue($this->existingCompany());
+                }
+                // Adresse siège pour création d'office (consommée à l'ajout du
+                // compte). On n'exige que les champs postaux minimaux de PS.
+                if ($result->hasUsableAddress()) {
+                    $this->pendingInseeAddress = [
+                        'address1' => (string) $result->address1,
+                        'address2' => (string) ($result->address2 ?? ''),
+                        'postcode' => (string) $result->postcode,
+                        'city'     => (string) $result->city,
+                        'siren'    => $result->siren,
+                    ];
                 }
                 break;
 
@@ -466,6 +553,9 @@ class Snt_Inscription_Pro extends Module
         $customer = $params['newCustomer'] ?? null;
         if ($customer instanceof Customer) {
             $this->persistProData($customer);
+            // Création d'office de l'adresse siège depuis l'INSEE (uniquement à
+            // la création du compte, pas à l'édition).
+            $this->maybeCreateInseeAddress($customer);
         }
     }
 
@@ -491,6 +581,73 @@ class Snt_Inscription_Pro extends Module
         if ($customer instanceof Customer && (int) $customer->id > 0) {
             $this->getRepository()->deleteByCustomer((int) $customer->id);
         }
+    }
+
+    /**
+     * Verrouillage en édition de l'adresse « siège social » créée d'office :
+     * PrestaShop ne sait pas rendre une adresse non éditable côté thème sans
+     * override, on l'impose donc côté serveur. On restaure silencieusement les
+     * valeurs persistées avant l'écriture → toute modification cliente devient
+     * un no-op (non destructif, pas d'erreur affichée).
+     *
+     * @param array{object: Address} $params
+     */
+    public function hookActionObjectAddressUpdateBefore($params): void
+    {
+        $address = $params['object'] ?? null;
+        if (!$address instanceof Address || (int) $address->id <= 0) {
+            return;
+        }
+        if (!$this->getRepository()->isLockedAddress((int) $address->id)) {
+            return;
+        }
+
+        $original = new Address((int) $address->id);
+        if ((int) $original->id <= 0) {
+            return;
+        }
+        foreach ([
+            'id_country', 'id_state', 'alias', 'company', 'lastname', 'firstname',
+            'vat_number', 'address1', 'address2', 'postcode', 'city', 'other',
+            'phone', 'phone_mobile', 'dni',
+        ] as $prop) {
+            $address->$prop = $original->$prop;
+        }
+
+        $this->getLogger()->log(Logger::TYPE_ADDRESS_LOCKED, [
+            'severity'    => Logger::SEVERITY_INFO,
+            'id_customer' => (int) $original->id_customer,
+            'message'     => 'Édition d\'une adresse verrouillée ignorée',
+            'context'     => ['id_address' => (int) $address->id],
+        ]);
+    }
+
+    /**
+     * Verrouillage en suppression de l'adresse « siège social » : refus par
+     * exception contrôlée tant que l'adresse est marquée verrouillée.
+     *
+     * @param array{object: Address} $params
+     */
+    public function hookActionObjectAddressDeleteBefore($params): void
+    {
+        $address = $params['object'] ?? null;
+        if (!$address instanceof Address || (int) $address->id <= 0) {
+            return;
+        }
+        if (!$this->getRepository()->isLockedAddress((int) $address->id)) {
+            return;
+        }
+
+        $this->getLogger()->log(Logger::TYPE_ADDRESS_LOCKED, [
+            'severity'    => Logger::SEVERITY_WARNING,
+            'id_customer' => (int) $address->id_customer,
+            'message'     => 'Suppression d\'une adresse verrouillée refusée',
+            'context'     => ['id_address' => (int) $address->id],
+        ]);
+
+        throw new PrestaShopException(
+            $this->l('Cette adresse (siège social) est verrouillée et ne peut pas être supprimée.')
+        );
     }
 
     /**
@@ -551,7 +708,23 @@ class Snt_Inscription_Pro extends Module
 
         $siret     = SiretValidator::normalize((string) Tools::getValue('siret', ''));
         $vatNumber = strtoupper(preg_replace('/\s+/', '', (string) Tools::getValue('vatNumber', '')));
-        $afe       = trim((string) Tools::getValue('afe', ''));
+
+        // On lit une seule fois la ligne existante pour préserver les champs non
+        // resoumis (hook déclenché hors formulaire, ou champ retiré du parcours).
+        $existing = $this->getRepository()->findByCustomer($idCustomer);
+
+        // L'AFE n'est plus saisie sur le formulaire de compte (elle est rattachée
+        // à l'adresse de facturation). Si le champ n'est pas soumis, on préserve
+        // la valeur déjà en base plutôt que de l'écraser à vide.
+        $afe = Tools::getIsset('afe')
+            ? trim((string) Tools::getValue('afe', ''))
+            : (string) ($existing['afe'] ?? '');
+
+        // Email comptable : soumis via le formulaire pro ; si absent (hook hors
+        // formulaire), on préserve la valeur déjà en base.
+        $accountingEmail = Tools::getIsset('accounting_email')
+            ? trim((string) Tools::getValue('accounting_email', ''))
+            : (string) ($existing['accounting_email'] ?? '');
 
         // Auto-calcul TVA si vide et SIREN dispo.
         if ($vatNumber === '' && strlen($siret) >= 9) {
@@ -578,9 +751,10 @@ class Snt_Inscription_Pro extends Module
 
         $this->getRepository()->upsert(
             $idCustomer,
-            $vatNumber !== '' ? $vatNumber : null,
-            $afe       !== '' ? $afe       : null,
-            $needsReview
+            $vatNumber       !== '' ? $vatNumber       : null,
+            $afe             !== '' ? $afe             : null,
+            $needsReview,
+            $accountingEmail !== '' ? $accountingEmail : null
         );
 
         // Journalisation : création/mise à jour d'un compte pro.
@@ -605,9 +779,106 @@ class Snt_Inscription_Pro extends Module
         $this->getRepository()->deleteByCustomer((int) $customer->id);
     }
 
+    /**
+     * Crée d'office l'adresse « siège social » du client pro à partir de
+     * l'adresse établissement renvoyée par l'INSEE (capturée en validation via
+     * `$this->pendingInseeAddress`). No-op si :
+     *  - l'INSEE n'a pas confirmé le SIRET ou n'a pas fourni d'adresse exploitable ;
+     *  - la France n'est pas résolvable en pays ;
+     *  - le client possède déjà au moins une adresse (évite les doublons).
+     *
+     * Ne fait jamais échouer la création du compte : toute erreur est journalisée
+     * et avalée.
+     */
+    private function maybeCreateInseeAddress(Customer $customer): void
+    {
+        $data = $this->pendingInseeAddress;
+        // On ne conserve pas l'adresse au-delà de la persistance courante.
+        $this->pendingInseeAddress = [];
+
+        if (empty($data['address1']) || empty($data['city']) || empty($data['postcode'])) {
+            return;
+        }
+
+        $idCustomer = (int) $customer->id;
+        if ($idCustomer <= 0) {
+            return;
+        }
+
+        // Anti-doublon : ne rien créer si le client a déjà une adresse active.
+        if ((int) Address::getFirstCustomerAddressId($idCustomer) > 0) {
+            return;
+        }
+
+        $idCountry = (int) Country::getByIso('FR');
+        if ($idCountry <= 0) {
+            return;
+        }
+
+        try {
+            $address              = new Address();
+            $address->id_customer = $idCustomer;
+            $address->id_country  = $idCountry;
+            $address->alias       = $this->l('Siège social');
+            $address->firstname   = (string) $customer->firstname;
+            $address->lastname    = (string) $customer->lastname;
+            $address->company     = (string) $customer->company;
+            $address->address1    = (string) $data['address1'];
+            $address->address2    = (string) ($data['address2'] ?? '');
+            $address->postcode    = (string) $data['postcode'];
+            $address->city        = (string) $data['city'];
+
+            // Téléphone : obligatoire pour une adresse PS, saisi sur le formulaire
+            // pro à la création. Validé en amont dans hookValidateCustomerFormFields.
+            $phone = trim((string) Tools::getValue('phone', ''));
+            if ($phone !== '') {
+                $address->phone = $phone;
+            }
+
+            // N° de TVA sur l'adresse (utile pour la facturation / mode B2B).
+            $siren = (string) ($data['siren'] ?? '');
+            if ($siren === '' && !empty($customer->siret)) {
+                $siren = SiretValidator::extractSiren((string) $customer->siret);
+            }
+            if ($siren !== '') {
+                $address->vat_number = (string) VatCalculator::fromSiret($siren);
+            }
+
+            if (!$address->validateFields(false) || !$address->validateFieldsLang(false)) {
+                $this->getLogger()->accountDegraded($idCustomer, null, 'insee_address_invalid');
+                return;
+            }
+
+            $address->add();
+
+            // Verrouillage : cette adresse « siège social » n'est pas éditable
+            // par le client (blocage serveur via les hooks Address). On mémorise
+            // son id pour que hookActionObjectAddressUpdate/DeleteBefore la
+            // reconnaissent.
+            if ((int) $address->id > 0) {
+                $this->getRepository()->setLockedAddress($idCustomer, (int) $address->id);
+            }
+        } catch (\Throwable $e) {
+            // Une adresse manquée ne doit jamais casser l'inscription.
+            $this->getLogger()->accountDegraded($idCustomer, null, 'insee_address_error');
+        }
+    }
+
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
+
+    /**
+     * Vrai si le formulaire est rendu pour un client déjà existant (page
+     * `identity` / édition compte), faux à la création (`registration`).
+     * Sert à n'injecter le champ téléphone qu'à la création (l'adresse
+     * « siège social » n'est créée qu'une fois).
+     */
+    private function isEditingExistingCustomer(): bool
+    {
+        return $this->context->customer instanceof Customer
+            && (int) $this->context->customer->id > 0;
+    }
 
     private function getRepository(): ProCustomerRepository
     {
@@ -638,18 +909,21 @@ class Snt_Inscription_Pro extends Module
      */
     private function prefillFromCustomer(?Customer $customer): array
     {
-        $defaults = ['is_pro' => '0', 'siret' => '', 'company' => '', 'vatNumber' => '', 'afe' => ''];
+        $defaults = ['is_pro' => '0', 'siren' => '', 'siret' => '', 'company' => '', 'vatNumber' => '', 'afe' => '', 'accounting_email' => ''];
         if (!$customer instanceof Customer || (int) $customer->id <= 0) {
             return $defaults;
         }
         $row = $this->getRepository()->findByCustomer((int) $customer->id);
         $hasPro = !empty($customer->siret) || $row !== null;
+        $siret  = (string) ($customer->siret ?? '');
         return [
-            'is_pro'    => $hasPro ? '1' : '0',
-            'siret'     => (string) ($customer->siret ?? ''),
-            'company'   => (string) ($customer->company ?? ''),
-            'vatNumber' => (string) ($row['vatNumber'] ?? ''),
-            'afe'       => (string) ($row['afe'] ?? ''),
+            'is_pro'           => $hasPro ? '1' : '0',
+            'siren'            => $siret !== '' ? SiretValidator::extractSiren($siret) : '',
+            'siret'            => $siret,
+            'company'          => (string) ($customer->company ?? ''),
+            'vatNumber'        => (string) ($row['vatNumber'] ?? ''),
+            'afe'              => (string) ($row['afe'] ?? ''),
+            'accounting_email' => (string) ($row['accounting_email'] ?? ''),
         ];
     }
 
@@ -771,6 +1045,7 @@ class Snt_Inscription_Pro extends Module
             . '<th>' . $this->l('SIRET') . '</th>'
             . '<th>' . $this->l('Raison sociale') . '</th>'
             . '<th>' . $this->l('N° TVA') . '</th>'
+            . '<th>' . $this->l('Email comptable') . '</th>'
             . '<th>' . $this->l('Mis à jour le') . '</th>'
             . '<th></th></tr></thead><tbody>';
 
@@ -783,6 +1058,7 @@ class Snt_Inscription_Pro extends Module
                 . '<td><code>' . $this->esc((string) ($r['siret'] ?? '')) . '</code></td>'
                 . '<td>' . $this->esc((string) ($r['company'] ?? '')) . '</td>'
                 . '<td>' . $this->esc((string) ($r['vatNumber'] ?? '')) . '</td>'
+                . '<td>' . $this->esc((string) ($r['accounting_email'] ?? '')) . '</td>'
                 . '<td>' . $this->esc((string) ($r['date_upd'] ?? '')) . '</td>'
                 . '<td><a class="btn btn-default btn-xs" href="' . $this->esc($this->customerLink($idCustomer)) . '">'
                 . '<i class="icon-search"></i> ' . $this->l('Voir') . '</a></td>'
@@ -803,6 +1079,7 @@ class Snt_Inscription_Pro extends Module
             Logger::TYPE_ACCOUNT_CREATED, Logger::TYPE_ACCOUNT_DEGRADED,
             Logger::TYPE_INSEE_CALL, Logger::TYPE_INSEE_ERROR,
             Logger::TYPE_API_ACCESS, Logger::TYPE_RATE_LIMITED, Logger::TYPE_ALERT_MAIL,
+            Logger::TYPE_ADDRESS_LOCKED,
         ];
         if ($type !== '' && !in_array($type, $types, true)) {
             $type = '';

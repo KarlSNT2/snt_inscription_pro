@@ -2,7 +2,7 @@
 <module>
     <name>snt_inscription_pro</name>
     <displayName><![CDATA[SNT Inscription Pro]]></displayName>
-    <version><![CDATA[1.1.0]]></version>
+    <version><![CDATA[1.3.0]]></version>
     <description><![CDATA[Enrichit l'inscription client PrestaShop avec les données professionnelles (SIRET vérifié INSEE, TVA intracom., AFE) sans activer le mode B2B global.]]></description>
     <author><![CDATA[SNT2]]></author>
     <tab><![CDATA[front_office_features]]></tab>

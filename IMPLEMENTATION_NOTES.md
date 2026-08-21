@@ -146,6 +146,139 @@ Variables exposées au JS via `Media::addJsDef` :
 
 ---
 
+## 8ter. Nouveautés v1.2.0 (adresse auto INSEE + déplacement AFE)
+
+**Adresse « siège social » créée d'office à l'inscription pro** — l'INSEE renvoie
+l'adresse de l'établissement (`etablissement.adresseEtablissement`), désormais
+parsée par `InseeClient::parseAddress()` et portée par `InseeResult`
+(`address1`/`address2`/`postcode`/`city` + `hasUsableAddress()`). La ré-vérif
+serveur (`applyInseeCheck`, `STATUS_FOUND`) capture cette adresse dans
+`$this->pendingInseeAddress` — **sans second appel API** — et
+`hookActionCustomerAccountAdd` la consomme via `maybeCreateInseeAddress()` :
+création d'un objet PS `Address` (pays FR, alias « Siège social »,
+`firstname`/`lastname` du client, `company`, `vat_number` calculé,
+`address1`/`postcode`/`city`). Garde-fous : no-op si l'INSEE n'a pas confirmé
+(donc pas d'adresse exploitable — décision produit : on ne fabrique pas de
+données), si la France n'est pas résolvable, ou si le client a déjà une adresse
+(`Address::getFirstCustomerAddressId`). Toute erreur est journalisée
+(`insee_address_invalid` / `insee_address_error`) et **n'interrompt jamais**
+l'inscription. Uniquement à la **création** (pas à l'édition compte).
+
+**AFE retirée du formulaire de compte** — le `FormField` `afe`, sa validation
+regex et le bouton JS « Utiliser mon SIREN » sont supprimés du parcours
+d'inscription/édition. La colonne `ps_snt_inscription_pro.afe`, le repository,
+l'endpoint API et les panneaux BO sont **conservés** (données existantes
+préservées). `persistProData` ne soumettant plus l'AFE, il **préserve** la valeur
+en base (`Tools::getIsset('afe')`) au lieu de l'écraser à vide.
+
+**À venir (Feature 2, non implémentée)** — rattachement de l'AFE à l'**adresse de
+facturation** : PrestaShop n'ayant pas de notion facturation/livraison en base,
+décision retenue = case à cocher « adresse de facturation » sur le formulaire
+d'adresse (`hookAdditionalCustomerAddressFields` + validation
+`actionValidateCustomerAddressForm`), champ AFE conditionnel, + flag
+`facturation` porté par une table module indexée sur `id_address`. Nécessitera
+une migration DB et un `upgrade-1.2.x.php`.
+
+---
+
+## 8quater. Nouveautés v1.3.0
+
+Cette version prépare la refonte SIREN (lots B/C à venir) et ajoute deux champs
+demandés par le métier. `config.xml` est réaligné sur la version du code (1.3.0).
+
+**Téléphone pro (obligatoire à la création)** — champ `phone` injecté par
+`hookAdditionalCustomerFormFields` **uniquement à la création** (détection via
+`isEditingExistingCustomer()` : à l'édition, l'adresse existe déjà). Validé
+(`Validate::isPhoneNumber`) et requis si `is_pro=1` dans
+`hookValidateCustomerFormFields`. **Non persisté en table module** : consommé une
+seule fois par `maybeCreateInseeAddress()` pour renseigner `Address::$phone`
+(champ obligatoire d'une adresse PS).
+
+**Email comptable** — nouvelle colonne `accounting_email VARCHAR(255)` sur
+`ps_snt_inscription_pro` (migration `upgrade-1.3.0.php`, idempotente). Champ
+`accounting_email` injecté (création + édition), validé (`Validate::isEmail`),
+**requis si pro**. Persisté via `ProCustomerRepository::upsert()` (nouveau
+paramètre), préservé si non resoumis (comme l'AFE), exposé dans l'endpoint API
+(`{ id_customer, vatNumber, afe, accounting_email }`) et affiché dans le panneau
+BO « Comptes pro à vérifier ».
+
+> ⚠️ Décision : `accounting_email` est **requis pour les comptes pro**, y compris
+> à l'édition. Les comptes pro créés avant 1.3.0 (email NULL) devront donc le
+> renseigner à leur prochaine modification de compte (backfill volontaire). Pour
+> le rendre optionnel : retirer le `addError` sur champ vide dans le `case
+> 'accounting_email'` de `hookValidateCustomerFormFields`.
+
+**JS** — `PRO_FIELDS` inclut désormais `phone` et `accounting_email` (réordonnés,
+masqués/affichés et `required` gérés avec le bloc pro). Les champs absents du DOM
+(ex. `phone` à l'édition) sont ignorés sans erreur.
+
+### Lot B — Bascule SIREN + sélection d'établissement
+
+**Saisie SIREN, plus SIRET direct.** Nouveau champ `siren` (9 chiffres) injecté par
+`hookAdditionalCustomerFormFields`. Au blur, le JS interroge l'INSEE via le
+contrôleur `validate` et alimente un `<select>` d'établissements ; la sélection
+écrit le **SIRET complet** dans le champ `siret` (qui reste la valeur autoritative
+persistée dans `ps_customer.siret` et re-vérifiée par l'INSEE au submit —
+`applyInseeCheck` inchangé). L'adresse « siège social » créée d'office correspond
+donc à l'établissement choisi (fetchSiret renvoie son adresse).
+
+- **Robustesse** : `siren` est `setRequired(false)` **côté serveur** (validé au
+  format seulement s'il est renseigné) afin de ne jamais bloquer le fallback
+  manuel ; le JS le rend requis dans le flux normal. La valeur autoritative reste
+  `siret`.
+- **INSEE — `InseeClient::searchBySiren()`** : endpoint recherche multicritère
+  `GET /siret?q=siren:XXXXXXXXX&nombre=1000` (un seul appel réseau, mêmes clé /
+  timeout / codes d'erreur que `fetchSiret`). Parsing mutualisé via
+  `extractEtablissement()` (utilisé aussi par `parseFound`). `InseeResult` porte
+  désormais `establishments[]` + fabrique `searchFound()`.
+- **Contrôleur `validate`** : bascule sur le paramètre `siren`. Réponse `ok` =
+  `{ siren, company, vat, establishments[], total, truncated }`. Tri **siège
+  d'abord, puis actifs, puis fermés**, plafonné à **200** établissements
+  (`truncated=true` au-delà — signalé au client). Rate-limit par IP inchangé.
+- **UX volume** : au-delà de **50** établissements, le JS affiche un champ de
+  **recherche/filtre** au-dessus du `<select>`. Siège pré-sélectionné par défaut
+  (ou l'établissement courant en édition).
+- **Fallback INSEE indisponible** (`degraded`/`unavailable`, mode non-strict) : le
+  JS repasse le champ `siret` en **saisie manuelle** (déverrouillé) + raison
+  sociale libre → compte marqué `needs_review` par le serveur. Identique à
+  l'esprit v1.1.0.
+
+### Lot C — Verrouillage de l'adresse « siège social »
+
+Nouvelle colonne `locked_address_id` sur la table module : `id_address` de
+l'adresse créée d'office, enregistré par `maybeCreateInseeAddress()` après
+`Address::add()` (`ProCustomerRepository::setLockedAddress()`).
+
+Deux hooks (enregistrés à l'install et via `upgrade-1.3.0.php` pour l'existant) :
+- **`actionObjectAddressUpdateBefore`** : si l'adresse est verrouillée
+  (`isLockedAddress()`), on **restaure silencieusement** les valeurs persistées
+  sur l'objet avant l'écriture → l'édition cliente devient un no-op non
+  destructif (pas d'erreur affichée). Log `address_locked` (info).
+- **`actionObjectAddressDeleteBefore`** : suppression **refusée** par
+  `PrestaShopException` contrôlée. Log `address_locked` (warning).
+
+> ⚠️ **Choix d'implémentation** : édition = no-op silencieux (PS affiche quand même
+> « adresse mise à jour » alors que rien ne change — non destructif, pas de page
+> d'erreur) ; suppression = blocage dur par exception (peut afficher une page
+> d'erreur PS selon le thème). PrestaShop ne permettant pas de rendre une adresse
+> non éditable côté thème sans override, c'est le seul levier serveur. Pour rendre
+> l'édition bloquante aussi (message clair), remplacer la restauration par un
+> `throw` dans `hookActionObjectAddressUpdateBefore`.
+
+> ⚠️ **Contrainte déménagement (non traitée — décision produit)** : si
+> l'établissement change d'adresse à l'INSEE après l'inscription, l'adresse
+> verrouillée **n'est pas mise à jour** automatiquement (elle est figée sur les
+> données de création et non éditable). Aucune synchronisation n'est prévue dans
+> cette version. Pour corriger une adresse obsolète : lever temporairement le
+> verrou (vider `locked_address_id` pour ce client en base), corriger l'adresse,
+> puis remettre le verrou — ou déléguer la correction au back-office (les hooks ne
+> bloquent que le contexte ObjectModel standard).
+
+Le type de log `address_locked` est ajouté à `Logger` et au filtre du panneau
+« Journal du module » (BO).
+
+---
+
 ## 9. Test manuel de bout en bout (Phase 1+2)
 
 - [x] Installation propre sur PS 8.x, table créée, colonne `ps_customer.siret` présente, hooks enregistrés, clé endpoint générée.

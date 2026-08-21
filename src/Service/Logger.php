@@ -28,6 +28,7 @@ final class Logger
     public const TYPE_API_ACCESS       = 'api_access';
     public const TYPE_RATE_LIMITED     = 'rate_limited';
     public const TYPE_ALERT_MAIL       = 'alert_mail';
+    public const TYPE_ADDRESS_LOCKED   = 'address_locked';
 
     // Sévérités.
     public const SEVERITY_INFO    = 1;

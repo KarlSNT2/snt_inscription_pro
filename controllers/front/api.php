@@ -7,8 +7,8 @@ use SNT\InscriptionPro\Repository\ProCustomerRepository;
 use SNT\InscriptionPro\Service\Logger;
 
 /**
- * Endpoint REST en lecture seule : renvoie `vatNumber` + `afe` pour un
- * `id_customer` donné. Consommé par un ERP / n8n externe.
+ * Endpoint REST en lecture seule : renvoie `vatNumber`, `afe` et
+ * `accounting_email` pour un `id_customer` donné. Consommé par un ERP / n8n externe.
  *
  * `siret` et `company` ne sont volontairement PAS exposés ici : ils sont déjà
  * couverts par le webservice PrestaShop natif.
@@ -64,9 +64,10 @@ class Snt_inscription_proApiModuleFrontController extends ModuleFrontController
         }
 
         $this->json(200, [
-            'id_customer' => $idCustomer,
-            'vatNumber'   => isset($row['vatNumber']) && $row['vatNumber'] !== null ? (string) $row['vatNumber'] : null,
-            'afe'         => isset($row['afe']) && $row['afe'] !== null ? (string) $row['afe'] : null,
+            'id_customer'      => $idCustomer,
+            'vatNumber'        => isset($row['vatNumber']) && $row['vatNumber'] !== null ? (string) $row['vatNumber'] : null,
+            'afe'              => isset($row['afe']) && $row['afe'] !== null ? (string) $row['afe'] : null,
+            'accounting_email' => isset($row['accounting_email']) && $row['accounting_email'] !== null ? (string) $row['accounting_email'] : null,
         ], true, $idCustomer, $ip, 'Accès autorisé');
     }
 

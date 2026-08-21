@@ -62,3 +62,19 @@
     background-color: #fffbe6;
     border-color: #f0c000;
 }
+
+/* Bloc de sélection d'établissement (injecté sous le champ SIREN). */
+.snt-ip-etab {
+    margin-top: 0.5rem;
+}
+
+.snt-ip-etab-label {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-size: 0.9em;
+    font-weight: 600;
+}
+
+.snt-ip-etab-select {
+    width: 100%;
+}
