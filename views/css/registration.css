@@ -4,6 +4,19 @@
     margin: 0.75rem 0;
 }
 
+/* Titres de section : séparent « informations de société » et « informations
+   personnelles ». Occupent toute la largeur (enfants directs du conteneur de
+   champs, hors grille .form-group). */
+.snt-ip-section-title {
+    clear: both;
+    margin: 1.5rem 0 1rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 2px solid #e2e8f0;
+    font-size: 1.1em;
+    font-weight: 700;
+    color: #1f2937;
+}
+
 .snt-ip-pro-toggle .snt-ip-radio {
     display: inline-flex;
     align-items: center;
@@ -52,6 +65,17 @@
     font-size: 0.85em;
 }
 
+/* Bouton « Utiliser mon SIREN » — recopie le SIREN dans le champ « adresse de
+   facturation électronique ». Inline sous le champ, largeur auto (même logique
+   que .snt-ip-btn-siren pour contrer les thèmes qui étirent .btn à 100%). */
+.snt-ip-use-siren {
+    display: inline-block !important;
+    width: auto !important;
+    margin-top: 0.35rem;
+    padding: 0.25rem 0.75rem;
+    font-size: 0.85em;
+}
+
 .snt-ip-readonly {
     background-color: #f5f5f5;
     cursor: not-allowed;
@@ -63,18 +87,186 @@
     border-color: #f0c000;
 }
 
-/* Bloc de sélection d'établissement (injecté sous le champ SIREN). */
-.snt-ip-etab {
+/* Aperçu de l'établissement (injecté sous le champ SIRET) : confirmation
+   visuelle en lecture seule de la raison sociale + adresse renvoyées par l'INSEE.
+   L'adresse est créée d'office comme adresse « Siège social » à l'inscription. */
+.snt-ip-siret-preview {
     margin-top: 0.5rem;
-}
-
-.snt-ip-etab-label {
-    display: block;
-    margin-bottom: 0.25rem;
+    padding: 0.6rem 0.9rem;
+    border: 1px solid #cfe8d6;
+    border-left: 3px solid #1a7f37;
+    border-radius: 4px;
+    background-color: #f2fbf5;
     font-size: 0.9em;
-    font-weight: 600;
+    line-height: 1.35;
 }
 
-.snt-ip-etab-select {
+.snt-ip-siret-preview-name {
+    font-weight: 600;
+    color: #1a7f37;
+}
+
+.snt-ip-siret-preview-address {
+    margin-top: 0.2rem;
+    color: #374151;
+}
+
+.snt-ip-siret-preview-warn {
+    margin-top: 0.25rem;
+    color: #92600a;
+}
+
+/* Garde « caractères spéciaux » (ticket 12063). */
+.snt-ip-charerror {
+    border: 1px solid #b42318 !important;
+}
+
+.snt-ip-chars-alert {
+    margin: 0 0 1rem;
+    padding: 0.6rem 0.9rem;
+    border: 1px solid #f5c2c0;
+    border-radius: 4px;
+    background-color: #fdecea;
+    color: #b42318;
+    font-size: 0.9em;
+}
+
+/* Info-bulles : pastille « ? » (fond bleu clair) à gauche du libellé ; la bulle
+   s'affiche au survol ou au focus clavier de la pastille. Tant que la bulle est
+   vide (texte non encore renseigné), elle reste masquée. */
+.snt-ip-tooltip {
+    position: relative;
+    display: inline-block;
+    margin-right: 0.4rem;
+    vertical-align: middle;
+}
+
+.snt-ip-tooltip-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.6em;
+    height: 1.6em;
+    border-radius: 50%;
+    border: 1px solid #9cc8f5;
+    background-color: #e6f2ff;
+    color: #1a73e8;
+    font-size: 0.8em;
+    font-weight: 700;
+    line-height: 1;
+    cursor: help;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.snt-ip-tooltip-popup {
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 8px);
+    transform: translateX(-50%);
+    z-index: 30;
+    display: none;
+    width: max-content;
+    min-width: 160px;
+    max-width: 280px;
+    padding: 0.5rem 0.7rem;
+    border-radius: 4px;
+    background-color: #1f2937;
+    color: #fff;
+    font-size: 0.85em;
+    font-weight: 400;
+    line-height: 1.35;
+    white-space: normal;
+    text-align: left;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+
+/* Petite flèche sous la bulle, pointant vers la pastille. */
+.snt-ip-tooltip-popup::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 5px solid transparent;
+    border-top-color: #1f2937;
+}
+
+/* Bulle vide (texte pas encore renseigné) : rien à afficher. */
+.snt-ip-tooltip-popup:empty {
+    display: none !important;
+}
+
+.snt-ip-tooltip:hover .snt-ip-tooltip-popup,
+.snt-ip-tooltip-icon:focus + .snt-ip-tooltip-popup {
+    display: block;
+}
+
+/* ------------------------------------------------------------------
+   Recherche établissement : sélecteur de mode + bloc raison sociale/CP
+   (injectés en tête du groupe de champs SIRET).
+   Les `!important` neutralisent les règles du thème (`.form-group label`,
+   `.form-group .form-control`) qui forcent labels et champs en pleine largeur.
+   ------------------------------------------------------------------ */
+.snt-ip-siret-mode {
+    display: flex !important;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.25rem;
+    margin-bottom: 0.6rem;
     width: 100%;
 }
+
+.snt-ip-siret-mode .snt-ip-siret-mode-opt {
+    display: inline-flex !important;
+    align-items: center;
+    gap: 0.35rem;
+    width: auto !important;
+    max-width: none;
+    margin: 0 !important;
+    padding: 0;
+    font-weight: 400;
+    cursor: pointer;
+}
+
+.snt-ip-siret-mode .snt-ip-siret-mode-opt input[type="radio"] {
+    width: auto !important;
+    margin: 0;
+}
+
+/* display sans !important : le masquage/affichage est piloté en JS via le style
+   inline (display:none / '') selon le mode choisi. Un !important ici forcerait le
+   bloc à rester toujours visible. */
+.snt-ip-rs-search {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.6rem;
+    width: 100%;
+}
+
+.snt-ip-rs-search .snt-ip-rs-name {
+    flex: 1 1 220px;
+    width: auto !important;
+    min-width: 160px;
+}
+
+.snt-ip-rs-search .snt-ip-rs-cp {
+    flex: 0 0 110px;
+    width: 110px !important;
+}
+
+.snt-ip-rs-search .snt-ip-rs-btn {
+    flex: 0 0 auto;
+    width: auto !important;
+}
+
+/* Liste des résultats : occupe toute la largeur sous les champs de recherche. */
+.snt-ip-rs-search .snt-ip-rs-results {
+    flex: 1 1 100%;
+    width: 100%;
+    margin-top: 0.15rem;
+}
+
+/* NB : les styles du bandeau « pro à compléter » (.snt-ip-pro-invite*) sont dans
+   views/css/pro-invite.css — chargé aussi sur le panier, où ce fichier ne l'est pas. */

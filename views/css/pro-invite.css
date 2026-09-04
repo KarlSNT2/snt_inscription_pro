@@ -1,0 +1,27 @@
+/* SNT Inscription Pro — bandeau d'invitation « pro à compléter ».
+   Chargé sur les pages où le bandeau peut apparaître (panier + tunnel), afin que
+   ces styles s'appliquent partout — contrairement à registration.css qui n'est
+   servi que sur les pages du formulaire client. */
+
+.snt-ip-pro-invite__text {
+    margin-bottom: 0.75rem;
+}
+
+.snt-ip-pro-invite .snt-ip-pro-invite__cta {
+    background-color: #324b50 !important;
+}
+
+.snt-ip-pro-invite .snt-ip-pro-invite__cta:hover {
+    background-color: #1a3d43 !important;
+}
+
+/* Lien discret « Ne plus afficher ce message », à côté du bouton principal. */
+.snt-ip-pro-invite .snt-ip-pro-invite__dismiss {
+    margin-left: 0.5rem;
+    text-transform: none;
+    color: #324b50 !important;
+}
+
+.snt-ip-pro-invite .snt-ip-pro-invite__dismiss:hover {
+    color: #1a3d43 !important;
+}

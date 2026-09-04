@@ -84,6 +84,38 @@ final class InseeClient
             return InseeResult::badRequest();
         }
 
+        // `q=siren:XXXXXXXXX` + pagination max (1000).
+        return $this->runSearch('siren:' . $siren, 1000);
+    }
+
+    /**
+     * Recherche d'établissements par raison sociale + code postal. La raison
+     * sociale est passée entre guillemets (les guillemets/antislashes internes
+     * sont échappés) sur le champ calculé `raisonSociale` ; le code postal filtre
+     * sur `codePostalEtablissement`. Résultat : liste d'établissements (le
+     * tri/filtre — fermés, plafond — est fait par le consommateur, cf. validate).
+     */
+    public function searchByNameAndPostcode(string $name, string $postcode): InseeResult
+    {
+        $name     = trim($name);
+        $postcode = preg_replace('/\D+/', '', $postcode) ?? '';
+        if ($name === '' || strlen($postcode) !== 5) {
+            return InseeResult::badRequest();
+        }
+
+        // Échappement Lucene : antislash et guillemet dans la valeur entre guillemets.
+        $escaped = str_replace(['\\', '"'], ['\\\\', '\\"'], $name);
+        $q = 'raisonSociale:"' . $escaped . '" AND codePostalEtablissement:' . $postcode;
+
+        return $this->runSearch($q, 100);
+    }
+
+    /**
+     * Exécute une recherche multicritère `/siret?q=...` et parse la liste
+     * d'établissements. Facteur commun de searchBySiren / searchByNameAndPostcode.
+     */
+    private function runSearch(string $q, int $nombre): InseeResult
+    {
         $apiKey = (string) Configuration::get('SNT_IP_INSEE_API_KEY');
         if ($apiKey === '') {
             $this->log('INSEE API key not configured');
@@ -95,11 +127,10 @@ final class InseeClient
             $timeout = 3;
         }
 
-        // `q=siren:XXXXXXXXX` + pagination max (1000). On restreint la réponse
-        // aux seuls champs utiles pour alléger le payload.
+        // On restreint la réponse aux seuls champs utiles pour alléger le payload.
         $query = http_build_query([
-            'q'      => 'siren:' . $siren,
-            'nombre' => 1000,
+            'q'      => $q,
+            'nombre' => $nombre,
         ]);
 
         // ENDPOINT se termine par « /siret/ » (lecture unitaire) ; la recherche

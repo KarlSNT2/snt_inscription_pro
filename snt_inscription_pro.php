@@ -45,6 +45,10 @@ class Snt_Inscription_Pro extends Module
         'SNT_IP_VIES_STRICT'       => '0',      // bloquer si VIES injoignable
         'SNT_IP_VIES_TIMEOUT'      => '5',      // timeout appel VIES (s)
         'SNT_IP_VIES_CACHE_TTL'    => '604800', // durée de vie du cache VIES (s) — 7 j
+        // Groupe client « pro à compléter » : les clients qui avaient une raison
+        // sociale (reset lors de la migration) y sont ajoutés ; le bandeau
+        // d'invitation ne s'affiche qu'aux membres de ce groupe. 0 => désactivé.
+        'SNT_IP_INVITE_GROUP_ID'   => '0',
     ];
 
     private const HOOKS = [
@@ -56,6 +60,11 @@ class Snt_Inscription_Pro extends Module
         'actionFrontControllerSetMedia',
         'actionObjectAddressUpdateBefore',
         'actionObjectAddressDeleteBefore',
+        // Bandeau d'invitation « mettez à jour vos infos pro » pour les clients
+        // pro pré-existants (raison sociale sur la fiche client, mais aucune donnée
+        // dans la table du module). Affiché sur le panier et dans le tunnel.
+        'displayShoppingCartFooter',
+        'displayCheckoutSummaryTop',
     ];
 
     private ?ProCustomerRepository $repository = null;
@@ -83,7 +92,7 @@ class Snt_Inscription_Pro extends Module
     {
         $this->name          = 'snt_inscription_pro';
         $this->tab           = 'front_office_features';
-        $this->version       = '1.5.0';
+        $this->version       = '1.8.0';
         $this->author        = 'SNT2';
         $this->need_instance = 0;
         $this->bootstrap     = true;
@@ -178,6 +187,8 @@ class Snt_Inscription_Pro extends Module
             `vatNumber`              VARCHAR(20)  DEFAULT NULL,
             `afe`                    VARCHAR(34)  DEFAULT NULL,
             `accounting_email`       VARCHAR(255) DEFAULT NULL,
+            `einvoicing_address`     VARCHAR(255) DEFAULT NULL,
+            `is_administration`      TINYINT(1)   NOT NULL DEFAULT 0,
             `locked_address_id`      INT(11) UNSIGNED DEFAULT NULL,
             `needs_review`           TINYINT(1)   NOT NULL DEFAULT 0,
             `date_add`               DATETIME     NOT NULL,
@@ -316,7 +327,45 @@ class Snt_Inscription_Pro extends Module
 
         $additions = [];
 
-        // is_pro : toujours ajouté (n'est jamais natif).
+        // Requis dynamique des champs pro. Un champ pro masqué (compte
+        // particulier, ou branche non-FR) ne doit JAMAIS porter un `required`
+        // (HTML5 ou serveur PS) : il bloquerait la soumission d'un pro non
+        // concerné. On calcule donc le contexte effectif :
+        //  - à la soumission (POST) : d'après is_pro / pro_country réellement
+        //    postés, pour que le cœur PS valide le required dans la bonne
+        //    branche uniquement ;
+        //  - au rendu initial (GET) : on suppose le parcours pro afin que les
+        //    labels s'affichent « obligatoire » dès que la branche pro est
+        //    montrée (le JS retire le required des champs restés masqués).
+        $submitted  = Tools::getIsset('is_pro');
+        $isProVal   = $submitted ? (string) Tools::getValue('is_pro') : '';
+        // « Professionnel » ('1') et « Administration » ('2') sont deux comptes pro :
+        // même parcours de champs. Seule l'AFE distingue (masquée pour l'administration).
+        $isProEff   = $submitted ? ($isProVal === '1' || $isProVal === '2') : true;
+        $countryEff = strtoupper(trim((string) ($submitted
+            ? Tools::getValue('pro_country', 'FR')
+            : $prefill['pro_country'])));
+        if ($countryEff === '') {
+            $countryEff = 'FR';
+        }
+        // `$reqFr` : champs propres à la branche FR (SIREN, adresse de
+        // facturation électronique). `$isProEff` : champs présents dans les deux
+        // branches (raison sociale).
+        $reqFr = $isProEff && ($countryEff === 'FR');
+
+        // Administration (3ᵉ choix du « Type de compte », is_pro = '2') -> pas
+        // d'adresse de facturation électronique exigée. À la soumission on lit la
+        // valeur postée du radio, au rendu la valeur stockée (édition). Sert à
+        // aligner le required cœur PS pour ne pas bloquer une administration à AFE
+        // vide ; l'obligation est aussi vérifiée dans validateFrenchPro.
+        $isAdminEff  = $submitted ? ($isProVal === '2') : (bool) $prefill['is_administration'];
+        $reqEinvoice = $reqFr && !$isAdminEff;
+
+        // is_pro : toujours ajouté (n'est jamais natif). NON requis côté serveur :
+        // la valeur « Particulier » vaut '0', or la validation required du cœur PS
+        // traite '0' comme vide (test de type empty()) et lèverait « Champ requis »
+        // sur un particulier. Le radio a toujours une valeur (Particulier
+        // pré-sélectionné via setValue), donc l'obligation serveur est inutile.
         $additions[] = (new FormField())
             ->setName('is_pro')
             ->setType('radio-buttons')
@@ -325,67 +374,67 @@ class Snt_Inscription_Pro extends Module
             ->setAvailableValues([
                 '0' => $this->l('Particulier'),
                 '1' => $this->l('Professionnel'),
+                // Administration : compte pro identique au professionnel, mais hors
+                // périmètre de la facturation électronique (AFE non demandée, cf. JS
+                // et validateFrenchPro). Persisté via la colonne `is_administration`.
+                '2' => $this->l('Administration'),
             ])
-            ->setRequired(true);
+            ->setRequired(false);
 
         // pro_country : pays de l'entreprise. Aiguille le parcours :
         //  - FR  -> SIREN / INSEE (+ VIES en complément) ;
         //  - autre UE -> n° TVA seul, vérifié par VIES.
         // Le JS masque/affiche les sous-champs selon ce choix ; le serveur route
         // la validation dans hookValidateCustomerFormFields.
+        // Requis pour un pro uniquement (`$isProEff`) : masqué pour un
+        // particulier, il ne doit pas participer à la validation required.
         $additions[] = (new FormField())
             ->setName('pro_country')
             ->setType('select')
             ->setLabel($this->l('Pays de l\'entreprise'))
             ->setValue($prefill['pro_country'])
             ->setAvailableValues($this->euCountryChoices())
-            ->setRequired(true);
+            ->setRequired($isProEff);
 
-        // siren : saisi par le client (9 chiffres). Au blur, le JS interroge
-        // l'INSEE et alimente un <select> d'établissements ; la sélection écrit
-        // le SIRET complet dans le champ `siret`. Non requis côté serveur (la
-        // valeur autoritative reste `siret`) pour préserver le fallback manuel
-        // en cas d'INSEE indisponible ; le JS le rend requis dans le flux normal.
-        $additions[] = (new FormField())
-            ->setName('siren')
-            ->setType('text')
-            ->setLabel($this->l('SIREN'))
-            ->setValue($prefill['siren'])
-            ->setRequired(false);
-
-        // siret : réutilise le field existant si présent, sinon on l'ajoute.
-        // Renseigné par la sélection d'établissement (JS) ou en saisie manuelle
-        // dans le fallback. Reste la valeur autoritative re-vérifiée par l'INSEE.
-        // Requis géré dynamiquement : côté serveur dans la branche FR
-        // (validateFrenchPro), côté client par le JS. `setRequired(false)` ici
-        // pour NE JAMAIS bloquer un pro non-FR (SIRET masqué) via un `required`
-        // HTML5 sur un champ caché.
+        // siret : point d'entrée du parcours FR. Le client le saisit (14 chiffres) ;
+        // au blur, le JS interroge l'INSEE et affiche un aperçu (raison sociale +
+        // adresse). C'est la valeur autoritative re-vérifiée au submit (INSEE),
+        // qui alimente aussi l'adresse siège créée d'office. Obligatoire pour un
+        // pro FR (`$reqFr`) ; NON requis en non-FR (masqué) — sinon un `required`
+        // HTML5 sur un champ caché bloque la soumission. On réutilise le field
+        // natif s'il existe (mode B2B PS), sinon on l'ajoute.
         if (isset($existingByName['siret'])) {
             if ($prefill['siret'] !== '') {
                 $existingByName['siret']->setValue($prefill['siret']);
             }
-            $existingByName['siret']->setRequired(false);
+            $existingByName['siret']->setRequired($reqFr);
         } else {
             $additions[] = (new FormField())
                 ->setName('siret')
                 ->setType('text')
                 ->setLabel($this->l('SIRET'))
                 ->setValue($prefill['siret'])
-                ->setRequired(false);
+                ->setRequired($reqFr);
         }
 
         // company : idem. Le readonly côté client est géré par le JS via
         // SNT_IP_COMPANY_EDITABLE ; le serveur verrouille dans validate.
+        // Obligatoire pour tout pro (`$isProEff`), dans les deux branches :
+        //  - FR       : renseignée automatiquement par l'INSEE (ou saisie
+        //               manuelle dans le fallback INSEE indisponible) ;
+        //  - autre UE : renseignée par VIES ou saisie manuellement.
         if (isset($existingByName['company'])) {
             if ($prefill['company'] !== '') {
                 $existingByName['company']->setValue($prefill['company']);
             }
+            $existingByName['company']->setRequired($isProEff);
         } else {
             $additions[] = (new FormField())
                 ->setName('company')
                 ->setType('text')
                 ->setLabel($this->l('Raison sociale'))
-                ->setValue($prefill['company']);
+                ->setValue($prefill['company'])
+                ->setRequired($isProEff);
         }
 
         // vatNumber : PS peut aussi le fournir en mode B2B — même stratégie.
@@ -410,27 +459,48 @@ class Snt_Inscription_Pro extends Module
         // adresse PS doit porter un téléphone). Uniquement à la CRÉATION du
         // compte — à l'édition, l'adresse existe déjà (et sera verrouillée).
         // Non persisté en table module : consommé une seule fois pour l'adresse.
-        // Requis géré dynamiquement (comme le SIRET) : côté serveur uniquement en
-        // branche FR (validateFrenchPro), côté client par le JS. `setRequired(false)`
-        // ici pour NE PAS bloquer un pro non-FR (téléphone masqué) via un `required`
-        // (HTML5 ou serveur) sur un champ caché.
+        // Requis suivant `$reqFr` (comme le SIRET) : obligatoire en branche FR pro
+        // (supprime aussi la mention « (optionnel) » du libellé), non requis en
+        // non-FR / particulier — le JS retire le `required` HTML5 sur le champ
+        // masqué pour ne pas bloquer la soumission.
         if (!$this->isEditingExistingCustomer()) {
             $additions[] = (new FormField())
                 ->setName('phone')
                 ->setType('text')
                 ->setLabel($this->l('Téléphone'))
                 ->setValue('')
-                ->setRequired(false);
+                ->setRequired($reqFr);
         }
 
         // email comptable : demandé par le service comptabilité. Persisté en
-        // table module et exposé à l'ERP via l'endpoint API.
+        // table module (NULL si vide) et exposé à l'ERP via l'endpoint API.
+        // Facultatif : jamais requis. Le format est vérifié côté serveur
+        // uniquement s'il est renseigné (cf. hookValidateCustomerFormFields).
         $additions[] = (new FormField())
             ->setName('accounting_email')
             ->setType('text')
             ->setLabel($this->l('Email comptable'))
             ->setValue($prefill['accounting_email'])
-            ->setRequired(true);
+            ->setRequired(false);
+
+        // Administration : plus de case dédiée — c'est désormais le 3ᵉ choix du
+        // « Type de compte » (is_pro = '2', cf. plus haut). Le caractère
+        // « administration » est dérivé de cette valeur, persisté dans la colonne
+        // `is_administration` et exposé à l'ERP via l'endpoint API.
+
+        // Adresse de facturation électronique (réforme de la facturation
+        // électronique) : identifiant de routage, = le SIREN dans la grande
+        // majorité des cas (bouton « Utiliser mon SIREN » côté JS), mais un autre
+        // identifiant reste possible. Persistée en table module et exposée à
+        // l'ERP via l'endpoint API. Obligatoire pour un pro FR (`$reqEinvoice`),
+        // SAUF administration (case cochée) ; masqué et non requis en non-FR
+        // (réforme française uniquement).
+        $additions[] = (new FormField())
+            ->setName('einvoicing_address')
+            ->setType('text')
+            ->setLabel($this->l('Adresse de facturation électronique'))
+            ->setValue($prefill['einvoicing_address'])
+            ->setRequired($reqEinvoice);
 
         return $additions;
     }
@@ -452,7 +522,10 @@ class Snt_Inscription_Pro extends Module
         $this->pendingNeedsReview  = false;
         $this->pendingInseeAddress = [];
 
-        if ($this->extractFieldValue($fields, 'is_pro') !== '1') {
+        // Professionnel ('1') ou Administration ('2') : même validation pro.
+        // Particulier ('0') : rien à valider.
+        $isProValue = (string) $this->extractFieldValue($fields, 'is_pro');
+        if ($isProValue !== '1' && $isProValue !== '2') {
             return $errors;
         }
 
@@ -461,12 +534,11 @@ class Snt_Inscription_Pro extends Module
             $byName[$field->getName()] = $field;
         }
 
-        // Email comptable : requis quel que soit le pays.
+        // Email comptable : facultatif. On vérifie seulement le format s'il est
+        // renseigné ; un champ vide est accepté (stocké NULL) dans les deux pays.
         if (isset($byName['accounting_email'])) {
             $accEmail = trim((string) $byName['accounting_email']->getValue());
-            if ($accEmail === '') {
-                $byName['accounting_email']->addError($this->l('L\'email comptable est obligatoire pour un compte professionnel.'));
-            } elseif (!Validate::isEmail($accEmail)) {
+            if ($accEmail !== '' && !Validate::isEmail($accEmail)) {
                 $byName['accounting_email']->addError($this->l('Email comptable invalide.'));
             }
         }
@@ -493,19 +565,15 @@ class Snt_Inscription_Pro extends Module
      */
     private function validateFrenchPro(array $byName): void
     {
-        if (isset($byName['siren'])) {
-            $siren = SiretValidator::normalize((string) $byName['siren']->getValue());
-            if ($siren !== '' && !SiretValidator::isSiren($siren)) {
-                $byName['siren']->addError($this->l('SIREN invalide : 9 chiffres attendus et clé de contrôle Luhn incorrecte.'));
-            }
-        }
-
+        // SIRET : point d'entrée obligatoire du parcours FR (le SIREN n'est plus
+        // demandé). Vide -> erreur ; renseigné -> contrôle de format (14 chiffres
+        // + clé Luhn) avant la re-vérif INSEE (applyInseeCheck).
         $siretField = $byName['siret'] ?? null;
         if ($siretField) {
             $siret = SiretValidator::normalize((string) $siretField->getValue());
-            if ((bool) Configuration::get('SNT_IP_SIRET_REQUIRED') && $siret === '') {
+            if ($siret === '') {
                 $siretField->addError($this->l('Le SIRET est obligatoire pour un compte professionnel.'));
-            } elseif ($siret !== '' && !SiretValidator::isSiret($siret)) {
+            } elseif (!SiretValidator::isSiret($siret)) {
                 $siretField->addError($this->l('SIRET invalide : 14 chiffres attendus et clé de contrôle Luhn incorrecte.'));
             }
         }
@@ -519,6 +587,31 @@ class Snt_Inscription_Pro extends Module
             }
         }
 
+        // Adresse de facturation électronique : obligatoire pour un pro FR, SAUF
+        // si le client a coché « Je suis une administration » (les administrations
+        // sont hors périmètre de la facturation électronique). Règle de format :
+        // si la valeur ressemble à un SIRET (14 chiffres) on vérifie la clé Luhn ;
+        // un SIREN (9 chiffres) ou tout autre identifiant non vide est accepté
+        // (255 caractères max). Le type de compte « Administration » (is_pro = '2')
+        // est la source de vérité (déclaratif).
+        $isAdministration = ((string) Tools::getValue('is_pro') === '2');
+        if (isset($byName['einvoicing_address'])) {
+            $einv = trim((string) $byName['einvoicing_address']->getValue());
+            if ($einv === '') {
+                if (!$isAdministration) {
+                    $byName['einvoicing_address']->addError($this->l('L\'adresse de facturation électronique est obligatoire pour un compte professionnel.'));
+                }
+            } elseif (mb_strlen($einv) > 255) {
+                $byName['einvoicing_address']->addError($this->l('Adresse de facturation électronique trop longue (255 caractères maximum).'));
+            } else {
+                $einvDigits = preg_replace('/\s+/', '', $einv);
+                if (preg_match('/^\d{14}$/', (string) $einvDigits) && !SiretValidator::isSiret(SiretValidator::normalize($einv))) {
+                    $byName['einvoicing_address']->addError($this->l('Adresse de facturation électronique : ce SIRET est invalide (clé de contrôle Luhn incorrecte).'));
+                }
+            }
+        }
+
+        // N° TVA intracom. : contrôle de format seulement (facultatif en FR).
         $vatField = $byName['vatNumber'] ?? null;
         if ($vatField) {
             $vat = VatValidator::normalize((string) $vatField->getValue());
@@ -696,13 +789,13 @@ class Snt_Inscription_Pro extends Module
         // confirmée par VIES (cf. vérification TVA intracom., Step 2).
         $strict = (bool) Configuration::get('SNT_IP_INSEE_STRICT');
 
-        // Économie de quota INSEE : le blur (recherche par SIREN) a déjà mémorisé
-        // les établissements en cache serveur. Si le SIRET soumis y figure encore
+        // Économie de quota INSEE : le blur (aperçu SIRET) a déjà mémorisé
+        // l'établissement en cache serveur. Si le SIRET soumis y figure encore
         // (dans le TTL), on réutilise cette donnée — émise côté serveur, donc
-        // autoritative — au lieu de rappeler l'INSEE. Sinon (saisie manuelle,
-        // cache expiré, édition sans blur), on interroge l'INSEE et on met le
-        // cache à jour. Seuls les appels réellement émis sont journalisés
-        // (`insee_call`), pour garder le compteur du journal exact.
+        // autoritative — au lieu de rappeler l'INSEE. Sinon (cache expiré, édition
+        // sans blur), on interroge l'INSEE et on met le cache à jour. Seuls les
+        // appels réellement émis sont journalisés (`insee_call`), pour garder le
+        // compteur du journal exact.
         $cache = new InseeCacheRepository();
         $ttl   = (int) Configuration::get('SNT_IP_INSEE_CACHE_TTL');
         $cached = $cache->get($siret, $ttl > 0 ? $ttl : 86400);
@@ -903,6 +996,18 @@ class Snt_Inscription_Pro extends Module
     public function hookActionFrontControllerSetMedia($params): void
     {
         $selfName = $this->context->controller->php_self ?? null;
+
+        // Bandeau d'invitation pro : styles chargés sur les pages où il peut
+        // apparaître (panier + tunnel). registration.css ne couvre pas le panier
+        // (`cart`), d'où ce fichier dédié.
+        if (in_array($selfName, ['cart', 'order'], true)) {
+            $this->context->controller->registerStylesheet(
+                'snt-ip-pro-invite',
+                'modules/' . $this->name . '/views/css/pro-invite.css',
+                ['media' => 'all', 'priority' => 200]
+            );
+        }
+
         if (!in_array($selfName, ['registration', 'authentication', 'identity', 'order'], true)) {
             return;
         }
@@ -930,6 +1035,72 @@ class Snt_Inscription_Pro extends Module
     }
 
     // ------------------------------------------------------------------
+    // Invitation « mettez à jour vos informations pro » (clients pré-existants)
+    // ------------------------------------------------------------------
+
+    /**
+     * Panier : bandeau d'invitation sous le récapitulatif du panier.
+     * @param array<string,mixed> $params
+     */
+    public function hookDisplayShoppingCartFooter($params): string
+    {
+        return $this->renderProInvite();
+    }
+
+    /**
+     * Tunnel de commande : bandeau d'invitation en haut du récapitulatif.
+     * @param array<string,mixed> $params
+     */
+    public function hookDisplayCheckoutSummaryTop($params): string
+    {
+        return $this->renderProInvite();
+    }
+
+    /**
+     * Rendu du bandeau invitant les clients pro « historiques » à compléter leurs
+     * informations pour bénéficier de la facturation électronique.
+     *
+     * Déclencheur : le client connecté appartient au groupe « pro à compléter »
+     * (`SNT_IP_INVITE_GROUP_ID`, alimenté par la migration SQL des clients qui
+     * avaient une raison sociale) ET n'a aucune ligne dans `ps_snt_inscription_pro`
+     * (il n'est pas encore passé par le parcours pro du module). Chaîne vide sinon.
+     */
+    private function renderProInvite(): string
+    {
+        $customer = $this->context->customer;
+        if (!$customer instanceof Customer || !$customer->isLogged() || (int) $customer->id <= 0) {
+            return '';
+        }
+
+        // Groupe « pro à compléter » : si non configuré, le bandeau est désactivé.
+        $inviteGroup = (int) Configuration::get('SNT_IP_INVITE_GROUP_ID');
+        if ($inviteGroup <= 0) {
+            return '';
+        }
+
+        // Le client doit appartenir au groupe.
+        $groups = array_map('intval', (array) $customer->getGroups());
+        if (!in_array($inviteGroup, $groups, true)) {
+            return '';
+        }
+
+        // Déjà connu du module : rien à proposer.
+        if ($this->getRepository()->findByCustomer((int) $customer->id) !== null) {
+            return '';
+        }
+
+        $this->smarty->assign([
+            'snt_ip_identity_url' => $this->context->link->getPageLink('identity', true),
+            'snt_ip_dismiss_url'  => $this->context->link->getModuleLink($this->name, 'dismiss', [], true),
+            // Token anti-CSRF — MÊME formule que le contrôleur dismiss
+            // (Snt_inscription_proDismissModuleFrontController::dismissToken).
+            'snt_ip_dismiss_token' => substr(Tools::hash('sntip-dismiss-' . (int) $customer->id), 0, 32),
+        ]);
+
+        return $this->fetch('module:' . $this->name . '/views/templates/hook/pro-invite.tpl');
+    }
+
+    // ------------------------------------------------------------------
     // Persistance
     // ------------------------------------------------------------------
 
@@ -945,7 +1116,8 @@ class Snt_Inscription_Pro extends Module
             // Hook déclenché hors formulaire (import, API interne...) : on n'écrase rien.
             return;
         }
-        $isPro = (string) $isPro === '1';
+        // Professionnel ('1') et Administration ('2') sont tous deux des comptes pro.
+        $isPro = ((string) $isPro === '1' || (string) $isPro === '2');
 
         if (!$isPro) {
             $this->handleDowngrade($customer);
@@ -972,6 +1144,16 @@ class Snt_Inscription_Pro extends Module
             ? trim((string) Tools::getValue('accounting_email', ''))
             : (string) ($existing['accounting_email'] ?? '');
 
+        // Adresse de facturation électronique : idem, préservée si non resoumise.
+        $einvoicingAddress = Tools::getIsset('einvoicing_address')
+            ? trim((string) Tools::getValue('einvoicing_address', ''))
+            : (string) ($existing['einvoicing_address'] ?? '');
+
+        // Administration : 3ᵉ choix du « Type de compte » (is_pro = '2'). On
+        // atteint ce point uniquement quand le formulaire pro a été soumis (cf.
+        // garde `is_pro` en amont).
+        $isAdministration = ((string) Tools::getValue('is_pro') === '2');
+
         // Pas d'auto-calcul de la TVA (le calcul mod-97 peut être erroné) : on
         // conserve strictement la valeur saisie par le client (vide => NULL).
 
@@ -995,10 +1177,12 @@ class Snt_Inscription_Pro extends Module
 
         $this->getRepository()->upsert(
             $idCustomer,
-            $vatNumber       !== '' ? $vatNumber       : null,
-            $afe             !== '' ? $afe             : null,
+            $vatNumber         !== '' ? $vatNumber         : null,
+            $afe               !== '' ? $afe               : null,
             $needsReview,
-            $accountingEmail !== '' ? $accountingEmail : null
+            $accountingEmail   !== '' ? $accountingEmail   : null,
+            $einvoicingAddress !== '' ? $einvoicingAddress : null,
+            $isAdministration
         );
 
         // Journalisation : création/mise à jour d'un compte pro.
@@ -1199,12 +1383,13 @@ class Snt_Inscription_Pro extends Module
      */
     private function prefillFromCustomer(?Customer $customer): array
     {
-        $defaults = ['is_pro' => '0', 'pro_country' => 'FR', 'siren' => '', 'siret' => '', 'company' => '', 'vatNumber' => '', 'afe' => '', 'accounting_email' => ''];
+        $defaults = ['is_pro' => '0', 'pro_country' => 'FR', 'siren' => '', 'siret' => '', 'company' => '', 'vatNumber' => '', 'afe' => '', 'accounting_email' => '', 'einvoicing_address' => '', 'is_administration' => false];
         if (!$customer instanceof Customer || (int) $customer->id <= 0) {
             return $defaults;
         }
         $row = $this->getRepository()->findByCustomer((int) $customer->id);
         $hasPro = !empty($customer->siret) || $row !== null;
+        $isAdmin = (bool) ($row['is_administration'] ?? false);
         $siret  = (string) ($customer->siret ?? '');
         $vatNumber = (string) ($row['vatNumber'] ?? '');
 
@@ -1221,7 +1406,7 @@ class Snt_Inscription_Pro extends Module
         }
 
         return [
-            'is_pro'           => $hasPro ? '1' : '0',
+            'is_pro'           => $hasPro ? ($isAdmin ? '2' : '1') : '0',
             'pro_country'      => $proCountry,
             'siren'            => $siret !== '' ? SiretValidator::extractSiren($siret) : '',
             'siret'            => $siret,
@@ -1229,6 +1414,8 @@ class Snt_Inscription_Pro extends Module
             'vatNumber'        => $vatNumber,
             'afe'              => (string) ($row['afe'] ?? ''),
             'accounting_email' => (string) ($row['accounting_email'] ?? ''),
+            'einvoicing_address' => (string) ($row['einvoicing_address'] ?? ''),
+            'is_administration' => $isAdmin,
         ];
     }
 
@@ -1389,6 +1576,7 @@ class Snt_Inscription_Pro extends Module
             . '<th>' . $this->l('Raison sociale') . '</th>'
             . '<th>' . $this->l('N° TVA') . '</th>'
             . '<th>' . $this->l('Email comptable') . '</th>'
+            . '<th>' . $this->l('Adresse fact. élec.') . '</th>'
             . '<th>' . $this->l('Mis à jour le') . '</th>'
             . '<th></th></tr></thead><tbody>';
 
@@ -1402,6 +1590,7 @@ class Snt_Inscription_Pro extends Module
                 . '<td>' . $this->esc((string) ($r['company'] ?? '')) . '</td>'
                 . '<td>' . $this->esc((string) ($r['vatNumber'] ?? '')) . '</td>'
                 . '<td>' . $this->esc((string) ($r['accounting_email'] ?? '')) . '</td>'
+                . '<td><code>' . $this->esc((string) ($r['einvoicing_address'] ?? '')) . '</code></td>'
                 . '<td>' . $this->esc((string) ($r['date_upd'] ?? '')) . '</td>'
                 . '<td><a class="btn btn-default btn-xs" href="' . $this->esc($this->customerLink($idCustomer)) . '">'
                 . '<i class="icon-search"></i> ' . $this->l('Voir') . '</a></td>'
@@ -1526,6 +1715,17 @@ class Snt_Inscription_Pro extends Module
                     ['type' => 'text', 'label' => $this->l('Cache INSEE : durée de vie (s)'),  'name' => 'SNT_IP_INSEE_CACHE_TTL', 'size' => 6],
                     ['type' => 'text', 'label' => $this->l('Timeout VIES (s)'),               'name' => 'SNT_IP_VIES_TIMEOUT', 'size' => 5],
                     ['type' => 'text', 'label' => $this->l('Cache VIES : durée de vie (s)'),   'name' => 'SNT_IP_VIES_CACHE_TTL', 'size' => 7],
+                    [
+                        'type'    => 'select',
+                        'label'   => $this->l('Groupe « pro à compléter » (bandeau d\'invitation)'),
+                        'name'    => 'SNT_IP_INVITE_GROUP_ID',
+                        'desc'    => $this->l('Les clients de ce groupe voient, sur le panier / tunnel, le bandeau les invitant à compléter leurs informations pro (tant qu\'ils ne sont pas passés par le parcours pro). « Désactivé » = aucun bandeau.'),
+                        'options' => [
+                            'query' => $this->groupOptions(),
+                            'id'    => 'id_option',
+                            'name'  => 'name',
+                        ],
+                    ],
                     $this->switchInput('SNT_IP_SIRET_REQUIRED',     $this->l('SIRET obligatoire si professionnel')),
                     $this->switchInput('SNT_IP_WRITE_COMPANY',      $this->l('Écrire la raison sociale depuis INSEE')),
                     $this->switchInput('SNT_IP_COMPANY_EDITABLE',   $this->l('Autoriser l\'édition libre de la raison sociale')),
@@ -1560,6 +1760,24 @@ class Snt_Inscription_Pro extends Module
             $values[$key] = Configuration::get($key);
         }
         return $values;
+    }
+
+    /**
+     * Options du sélecteur de groupe « pro à compléter » : « Désactivé » (0) puis
+     * la liste des groupes clients (id affiché pour repérer le bon groupe).
+     *
+     * @return array<int,array{id_option:int,name:string}>
+     */
+    private function groupOptions(): array
+    {
+        $out = [['id_option' => 0, 'name' => $this->l('— Désactivé (aucun bandeau) —')]];
+        foreach (Group::getGroups((int) $this->context->language->id) as $g) {
+            $out[] = [
+                'id_option' => (int) $g['id_group'],
+                'name'      => (string) $g['name'] . ' (#' . (int) $g['id_group'] . ')',
+            ];
+        }
+        return $out;
     }
 
     private function getEndpointUrl(): string

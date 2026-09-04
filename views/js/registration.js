@@ -2,10 +2,14 @@
  * SNT Inscription Pro — front logic.
  *  - Réordonne le DOM : is_pro + champs pro tout en haut du bloc formulaire.
  *  - Toggle show/hide selon `is_pro` + gestion `required` dynamique.
- *  - Parcours SIREN : saisie du SIREN → appel AJAX INSEE → <select> des
- *    établissements → la sélection renseigne le champ `siret` (autoritatif),
- *    la raison sociale et le n° de TVA.
- *  - Fallback saisie manuelle du SIRET quand l'INSEE est indisponible.
+ *  - Parcours FR (deux modes, au choix du client) :
+ *      • saisie directe du SIRET → appel AJAX INSEE → aperçu (raison sociale +
+ *        adresse) sous le champ ;
+ *      • recherche par raison sociale + code postal → liste d'établissements →
+ *        la sélection renseigne le SIRET (autoritatif) et déclenche le même aperçu.
+ *    Le SIRET renseigne aussi l'AFE (SIREN) et le n° de TVA (calcul FR), tous deux
+ *    modifiables. La re-vérif serveur au submit fait foi et crée l'adresse siège.
+ *  - Fallback saisie manuelle de la raison sociale quand l'INSEE est indisponible.
  *  - Rend `company` readonly quand SNT_IP_COMPANY_EDITABLE = false.
  */
 (function () {
@@ -15,9 +19,15 @@
         window.console.debug('[SNT-IP] registration.js loaded');
     }
 
-    // pro_country (sélecteur pays) + siren/siret (branche FR) + company/vatNumber
-    // + phone (création FR) + accounting_email.
-    var PRO_FIELDS = ['pro_country', 'siren', 'siret', 'company', 'vatNumber', 'phone', 'accounting_email'];
+    // pro_country (sélecteur pays) + siret (branche FR, saisi directement) +
+    // company/vatNumber + phone (création FR) + accounting_email +
+    // einvoicing_address. Le SIREN n'est plus demandé : le SIRET est le point
+    // d'entrée du parcours FR (vérifié à l'INSEE au blur).
+    // L'« administration » n'est plus un champ distinct : c'est la 3ᵉ valeur du
+    // radio « Type de compte » (is_pro = '2'), cf. isAdministrationChecked().
+    // L'ordre de ce tableau pilote l'ordre d'affichage des champs (cf.
+    // reorderFields) : le n° de TVA est placé AU-DESSUS de la raison sociale.
+    var PRO_FIELDS = ['pro_country', 'siret', 'vatNumber', 'company', 'phone', 'accounting_email', 'einvoicing_address'];
 
     var CFG = {
         validateUrl:     window.SNT_IP_VALIDATE_URL || '',
@@ -28,24 +38,11 @@
 
     var LUHN_EXCEPTIONS_SIREN = ['356000000']; // La Poste
 
-    // Au-delà de ce nombre d'établissements, on affiche un champ de recherche
-    // pour filtrer le <select> (SIREN à établissements très nombreux).
-    var FILTER_THRESHOLD = 50;
-
-    // Modes d'affichage du champ SIRET :
-    //  - 'hidden'   : masqué, renseigné par la sélection d'établissement (création).
-    //  - 'readonly' : visible en lecture seule (édition : montre l'établissement courant).
-    //  - 'manual'   : visible et éditable (fallback INSEE indisponible).
-    var siretMode = 'hidden';
-
-    // Dernière liste d'établissements reçue (pour le filtrage).
-    var establishmentsData = [];
-
-    // Dernier SIREN pour lequel un appel a déjà été lancé : évite les appels
-    // INSEE redondants si le `blur` se redéclenche sur la même valeur (focus qui
+    // Dernier SIRET pour lequel un appel INSEE a déjà été lancé : évite les
+    // appels redondants si le `blur` se redéclenche sur la même valeur (focus qui
     // rebondit, autofill, réordonnancement DOM). Réinitialisé dès que le champ
-    // SIREN est réédité (listener `input`).
-    var lastSearchedSiren = '';
+    // SIRET est réédité (listener `input`).
+    var lastSearchedSiret = '';
 
     // ------------------------------------------------------------------
     // Utilitaires DOM
@@ -88,9 +85,13 @@
         return seen;
     }
 
+    // Professionnel ('1') et Administration ('2') sont deux comptes pro :
+    // mêmes champs affichés. Seule l'AFE diffère (cf. isAdministrationChecked).
     function isProChecked() {
         var checked = document.querySelector('input[name="is_pro"]:checked');
-        return !!(checked && String(checked.value) === '1');
+        if (!checked) { return false; }
+        var v = String(checked.value);
+        return v === '1' || v === '2';
     }
 
     function firstDirectFormGroup(parent) {
@@ -170,9 +171,63 @@
                 }
             });
         });
+        // Le titre « Mes informations de société » suit le bloc pro (masqué pour un
+        // particulier). Le titre « personnelles » reste toujours affiché.
+        var socTitle = document.getElementById('snt-ip-title-company');
+        if (socTitle) { socTitle.style.display = show ? '' : 'none'; }
         if (show) {
             // Aiguillage FR / non-FR selon le pays choisi (gère aussi le SIRET).
             applyBranch();
+        }
+    }
+
+    // Premier champ « personnel » (non pro, hors sélecteur de type de compte) dans
+    // le conteneur du formulaire : sert d'ancre au titre « informations personnelles ».
+    function firstPersonalWrapper(parent) {
+        var toggle = toggleGroup();
+        var proSet = proWrappers();
+        for (var i = 0; i < parent.children.length; i++) {
+            var c = parent.children[i];
+            if (!c.classList || !c.classList.contains('form-group')) { continue; }
+            if (c === toggle) { continue; }
+            if (proSet.indexOf(c) !== -1) { continue; }
+            return c;
+        }
+        return null;
+    }
+
+    // Crée (idempotent) un titre de section.
+    function ensureSectionTitle(id, text) {
+        var el = document.getElementById(id);
+        if (el) { return el; }
+        el = document.createElement('div');
+        el.id = id;
+        el.className = 'snt-ip-section-title';
+        el.textContent = text;
+        return el;
+    }
+
+    // Insère les deux titres de section :
+    //  - « Mes informations de société » juste après le sélecteur de type de compte
+    //    (donc en tête du bloc pro ; masqué avec lui pour un particulier) ;
+    //  - « Mes informations personnelles » avant le premier champ personnel.
+    // À appeler APRÈS reorderFields (les champs pro sont alors regroupés en tête).
+    function setupSectionTitles() {
+        var toggle = toggleGroup();
+        if (!toggle || !toggle.parentElement) { return; }
+        var parent = toggle.parentElement;
+
+        var soc = ensureSectionTitle('snt-ip-title-company', 'Mes informations de société');
+        if (soc.previousSibling !== toggle || soc.parentElement !== parent) {
+            parent.insertBefore(soc, toggle.nextSibling);
+        }
+
+        var firstPerso = firstPersonalWrapper(parent);
+        if (firstPerso) {
+            var perso = ensureSectionTitle('snt-ip-title-personal', 'Mes informations personnelles');
+            if (perso.nextSibling !== firstPerso || perso.parentElement !== firstPerso.parentElement) {
+                firstPerso.parentElement.insertBefore(perso, firstPerso);
+            }
         }
     }
 
@@ -198,9 +253,116 @@
         if (w) { w.style.display = show ? '' : 'none'; }
     }
 
+    // Masque/affiche la mention « (optionnel/facultatif) » que le thème ajoute au
+    // libellé du n° de TVA : en non-FR la TVA est obligatoire, on la retire. On
+    // cible l'élément-feuille dont le texte EST cette mention (pas un libellé qui
+    // la contiendrait dans une phrase). NB : si le thème l'écrit en simple nœud
+    // texte (non un élément), rien à masquer — le champ reste requis (HTML5).
+    function setVatOptionalMentionHidden(hide) {
+        var group = wrapperOf(fieldByName('vatNumber'));
+        if (!group) { return; }
+        var re = /^\(?\s*(optionnel|facultatif|optional)\s*\)?$/i;
+        Array.prototype.forEach.call(group.querySelectorAll('*'), function (el) {
+            if (el.children.length !== 0) { return; }
+            var tag = el.tagName;
+            if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') { return; }
+            if (re.test((el.textContent || '').trim())) {
+                el.style.display = hide ? 'none' : '';
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Adresse de facturation électronique : auto-remplissage depuis le SIRET
+    // ------------------------------------------------------------------
+
+    // Pré-remplit l'AFE avec le SIREN (9 premiers chiffres du SIRET) dès que le
+    // SIRET est renseigné, tant que le client ne l'a pas modifiée lui-même : dès
+    // qu'il y saisit autre chose (drapeau `sntIpTouched`), on ne l'écrase plus.
+    // Le champ reste librement éditable. N'agit qu'en branche FR pro et hors
+    // administration (l'AFE est masquée dans ce cas).
+    function syncEinvoicingFromSiret() {
+        if (!isProChecked() || !isFrCountry() || isAdministrationChecked()) { return; }
+        var einv = fieldByName('einvoicing_address');
+        if (!einv || einv.dataset.sntIpTouched === '1') { return; }
+        var siret = fieldByName('siret');
+        var digits = String((siret && siret.value) || '').replace(/\D/g, '');
+        if (digits.length < 9) { return; }
+        // Affectation programmatique : ne déclenche pas d'événement `input`, donc
+        // ne marque pas le champ comme « modifié par l'utilisateur ».
+        einv.value = digits.slice(0, 9);
+    }
+
+    // ------------------------------------------------------------------
+    // N° TVA intracom. FR : auto-remplissage depuis le SIRET
+    // ------------------------------------------------------------------
+
+    // Calcule le n° de TVA intracommunautaire français à partir du SIREN.
+    // Structure : FR + clé (2 chiffres) + SIREN, avec
+    //   clé = (12 + 3 × (SIREN mod 97)) mod 97.
+    // Le SIREN à 9 chiffres tient dans un entier JS (< 2^53), le modulo est donc
+    // exact. Renvoie '' si le SIREN n'a pas 9 chiffres.
+    function frenchVatNumber(siren) {
+        if (!/^\d{9}$/.test(siren)) { return ''; }
+        var key = (12 + 3 * (parseInt(siren, 10) % 97)) % 97;
+        var kk = (key < 10 ? '0' : '') + key;
+        return 'FR' + kk + siren;
+    }
+
+    // Pré-remplit le n° de TVA avec le numéro calculé depuis le SIREN (9 premiers
+    // chiffres du SIRET), tant que le client ne l'a pas modifié (drapeau
+    // `sntIpTouched`). Le champ reste librement éditable, et VIES reste l'arbitre :
+    // le numéro calculé est structurellement valide mais ne garantit pas que
+    // l'entreprise soit assujettie (ex. franchise en base) — VIES le signalera.
+    // N'agit qu'en branche FR pro (en non-FR, le client saisit son propre numéro).
+    function syncVatFromSiret() {
+        if (!isProChecked() || !isFrCountry()) { return; }
+        var vat = fieldByName('vatNumber');
+        if (!vat || vat.dataset.sntIpTouched === '1') { return; }
+        var siret = fieldByName('siret');
+        var digits = String((siret && siret.value) || '').replace(/\D/g, '');
+        if (digits.length < 9) { return; }
+        var full = frenchVatNumber(digits.slice(0, 9));
+        if (full) { vat.value = full; }
+    }
+
+    // ------------------------------------------------------------------
+    // Règle « administration » : le 3ᵉ choix du « Type de compte » (is_pro = '2')
+    // exempte le client de l'adresse de facturation électronique (hors périmètre
+    // de la réforme). Administration -> AFE masquée + non requise ; Professionnel
+    // -> AFE requise.
+    // ------------------------------------------------------------------
+
+    function isAdministrationChecked() {
+        var checked = document.querySelector('input[name="is_pro"]:checked');
+        return !!(checked && String(checked.value) === '2');
+    }
+
+    // Applique l'état « administration » au champ AFE, en branche FR pro seulement.
+    // Admin -> AFE masquée, non requise, vidée.
+    // Sinon  -> AFE affichée + requise + auto-remplie depuis le SIRET.
+    function applyEinvoicingAdminState() {
+        if (!isProChecked() || !isFrCountry()) { return; }
+        var einv = fieldByName('einvoicing_address');
+        if (!einv) { return; }
+        var wrapper = wrapperOf(einv);
+
+        if (isAdministrationChecked()) {
+            if (wrapper) { wrapper.style.display = 'none'; }
+            einv.value = '';
+            einv.removeAttribute('required');
+            einv.dataset.sntIpRequired = '';
+        } else {
+            if (wrapper) { wrapper.style.display = ''; }
+            einv.setAttribute('required', 'required');
+            einv.dataset.sntIpRequired = '1';
+            syncEinvoicingFromSiret();
+        }
+    }
+
     /**
      * Affiche/masque les sous-champs selon le pays :
-     *  - FR       : SIREN + établissements + SIRET + téléphone ;
+     *  - FR       : SIRET (saisi + vérifié INSEE) + téléphone ;
      *  - autre UE : n° TVA (requis) + raison sociale (éditable), le reste masqué.
      */
     function applyBranch() {
@@ -208,7 +370,6 @@
         var fr = isFrCountry();
 
         // Champs propres à la branche FR.
-        setWrapperVisible('siren', fr);
         setWrapperVisible('phone', fr);
 
         // Téléphone : requis pour l'adresse siège FR, inutile en non-FR (pas
@@ -226,17 +387,44 @@
             }
         }
 
+        // Adresse de facturation électronique : demandée uniquement en FR
+        // (réforme française). Requise en FR, masquée + non requise sinon.
+        setWrapperVisible('einvoicing_address', fr);
+        var einv = fieldByName('einvoicing_address');
+        if (einv) {
+            if (fr) {
+                einv.setAttribute('required', 'required');
+                einv.dataset.sntIpRequired = '1';
+            } else {
+                einv.removeAttribute('required');
+                einv.dataset.sntIpRequired = '';
+            }
+        }
+        // Applique l'état administration (AFE masquée) ou professionnel (AFE
+        // affichée + requise + auto-remplie depuis le SIRET).
+        applyEinvoicingAdminState();
+
+        // SIRET : point d'entrée du parcours FR. Deux modes (cf. ensureSearchUI) :
+        // saisie directe du SIRET, ou recherche par raison sociale + code postal.
+        // En non-FR, le groupe SIRET est entièrement masqué et non requis (sinon un
+        // champ requis caché bloque la soumission).
         var siret = fieldByName('siret');
+        var sw = wrapperOf(siret);
         if (fr) {
-            syncSiretVisibility();
+            if (sw) { sw.style.display = ''; }
+            ensureSearchUI();
+            applySiretMode();
         } else {
-            var sw = wrapperOf(siret);
             if (sw) { sw.style.display = 'none'; }
-            if (siret) { siret.removeAttribute('required'); }
-            showEtabUI(false);
+            if (siret) {
+                siret.removeAttribute('required');
+                siret.dataset.sntIpRequired = '';
+            }
+            hideSiretPreview();
         }
 
-        // TVA : requise en non-FR, optionnelle en FR.
+        // TVA : requise en non-FR (n° obligatoire, mention « (optionnel) » retirée
+        // du libellé), optionnelle en FR.
         var vat = fieldByName('vatNumber');
         if (vat) {
             if (fr) {
@@ -247,10 +435,19 @@
                 vat.dataset.sntIpRequired = '1';
             }
         }
+        setVatOptionalMentionHidden(!fr);
+        // En FR, pré-remplit le n° de TVA calculé si un SIRET est déjà saisi
+        // (couvre le cas d'un passage tardif en branche FR / Professionnel).
+        if (fr) { syncVatFromSiret(); }
 
         // Raison sociale : éditable (saisie manuelle) en non-FR ; readonly en FR.
+        // Obligatoire pour tout pro dans les deux branches (renseignée par
+        // l'INSEE/VIES ou saisie manuelle). applyBranch() ne s'exécute que
+        // lorsque « Professionnel » est coché, donc on marque toujours requis.
         var comp = fieldByName('company');
         if (comp) {
+            comp.setAttribute('required', 'required');
+            comp.dataset.sntIpRequired = '1';
             if (fr) {
                 applyCompanyReadonly();
             } else {
@@ -310,37 +507,6 @@
     }
 
     // ------------------------------------------------------------------
-    // Gestion du champ SIRET (hidden / readonly / manual)
-    // ------------------------------------------------------------------
-
-    function setSiretMode(mode) {
-        siretMode = mode;
-        syncSiretVisibility();
-    }
-
-    function syncSiretVisibility() {
-        var input = fieldByName('siret');
-        var wrapper = wrapperOf(input);
-        if (!input || !wrapper) return;
-
-        if (!isProChecked()) {
-            // Laissé à applyVisibility (masqué).
-            return;
-        }
-
-        if (siretMode === 'hidden') {
-            wrapper.style.display = 'none';
-            input.setAttribute('readonly', 'readonly');
-        } else if (siretMode === 'readonly') {
-            wrapper.style.display = '';
-            input.setAttribute('readonly', 'readonly');
-        } else { // manual
-            wrapper.style.display = '';
-            input.removeAttribute('readonly');
-        }
-    }
-
-    // ------------------------------------------------------------------
     // Validation locale (Luhn)
     // ------------------------------------------------------------------
 
@@ -362,12 +528,6 @@
         return sum % 10 === 0;
     }
 
-    function isValidSirenLocal(siren) {
-        if (siren.length !== 9) return false;
-        if (LUHN_EXCEPTIONS_SIREN.indexOf(siren) !== -1) return true;
-        return luhnCheck(siren);
-    }
-
     function isValidSiretLocal(siret) {
         if (siret.length !== 14) return false;
         var siren = siret.substring(0, 9);
@@ -378,13 +538,13 @@
     }
 
     // ------------------------------------------------------------------
-    // Statut (sous le champ SIREN)
+    // Statut (sous le champ SIRET)
     // ------------------------------------------------------------------
 
     function ensureStatusEl() {
-        // Hôte du statut : le SIREN en branche FR, le n° TVA en branche non-FR.
-        var host = isFrCountry() ? fieldByName('siren') : fieldByName('vatNumber');
-        if (!host) { host = fieldByName('siren') || fieldByName('vatNumber'); }
+        // Hôte du statut : le SIRET en branche FR, le n° TVA en branche non-FR.
+        var host = isFrCountry() ? fieldByName('siret') : fieldByName('vatNumber');
+        if (!host) { host = fieldByName('siret') || fieldByName('vatNumber'); }
         if (!host) return null;
         var container = inlineContainerOf(host);
         if (!container) return null;
@@ -418,180 +578,84 @@
     }
 
     // ------------------------------------------------------------------
-    // <select> des établissements
+    // Aperçu établissement (sous le champ SIRET)
     // ------------------------------------------------------------------
+    // Bloc informatif (lecture seule) affiché sous le SIRET : raison sociale +
+    // adresse de l'établissement renvoyées par l'INSEE. Il confirme visuellement
+    // que le SIRET saisi désigne le bon établissement. L'adresse n'est pas
+    // éditable ici : elle est créée d'office comme adresse « Siège social » à
+    // l'inscription (cf. maybeCreateInseeAddress côté serveur).
 
-    function ensureEtabUI() {
-        var sirenInput = fieldByName('siren');
-        if (!sirenInput) return null;
-        var container = inlineContainerOf(sirenInput);
+    function ensureSiretPreview() {
+        var siret = fieldByName('siret');
+        if (!siret) return null;
+        // Rattaché à la colonne du champ SIRET (et non à la ligne .form-group) pour
+        // s'aligner sur la largeur des autres champs. Reste visible en mode
+        // « recherche » : on n'y masque que l'input SIRET, pas sa colonne.
+        var container = inlineContainerOf(siret);
         if (!container) return null;
-
-        var block = container.querySelector('.snt-ip-etab');
+        var block = container.querySelector('.snt-ip-siret-preview');
         if (block) return block;
-
         block = document.createElement('div');
-        block.className = 'snt-ip-etab';
-
-        var filter = document.createElement('input');
-        filter.type = 'text';
-        filter.className = 'snt-ip-etab-filter form-control';
-        filter.placeholder = 'Filtrer les établissements…';
-        filter.style.display = 'none';
-        filter.style.marginBottom = '6px';
-        filter.addEventListener('input', function () {
-            renderOptions(filterList(establishmentsData, filter.value));
-        });
-
-        var label = document.createElement('label');
-        label.className = 'snt-ip-etab-label';
-        label.textContent = 'Établissement';
-
-        var select = document.createElement('select');
-        select.className = 'snt-ip-etab-select form-control';
-        select.addEventListener('change', function () {
-            var item = findBySiret(establishmentsData, select.value);
-            applyEstablishmentSelection(item);
-        });
-
-        block.appendChild(label);
-        block.appendChild(filter);
-        block.appendChild(select);
+        block.className = 'snt-ip-siret-preview';
+        block.style.display = 'none';
         container.appendChild(block);
         return block;
     }
 
-    function getEtabSelect() {
-        var block = ensureEtabUI();
-        return block ? block.querySelector('.snt-ip-etab-select') : null;
+    function formatAddress(addr) {
+        if (!addr) return '';
+        var lines = [];
+        if (addr.address1) lines.push(addr.address1);
+        if (addr.address2) lines.push(addr.address2);
+        var cp = [addr.postcode, addr.city].filter(Boolean).join(' ');
+        if (cp) lines.push(cp);
+        return lines.join('\n');
     }
 
-    function getEtabFilter() {
-        var block = ensureEtabUI();
-        return block ? block.querySelector('.snt-ip-etab-filter') : null;
-    }
+    function showSiretPreview(company, addr, closed) {
+        var block = ensureSiretPreview();
+        if (!block) return;
+        block.innerHTML = '';
 
-    function showEtabUI(show) {
-        var block = ensureEtabUI();
-        if (block) block.style.display = show ? '' : 'none';
-    }
+        var name = document.createElement('div');
+        name.className = 'snt-ip-siret-preview-name';
+        name.textContent = (closed ? '⚠ ' : '✓ ') + (company || 'Établissement trouvé');
+        block.appendChild(name);
 
-    function findBySiret(list, siret) {
-        for (var i = 0; i < list.length; i++) {
-            if (String(list[i].siret) === String(siret)) return list[i];
+        var addrText = formatAddress(addr);
+        if (addrText) {
+            var a = document.createElement('div');
+            a.className = 'snt-ip-siret-preview-address';
+            // Adresse multi-lignes : on rend les retours à la ligne visibles.
+            a.style.whiteSpace = 'pre-line';
+            a.textContent = addrText;
+            block.appendChild(a);
         }
-        return null;
-    }
-
-    function filterList(list, term) {
-        term = String(term || '').toLowerCase().replace(/\s+/g, '');
-        if (term === '') return list;
-        return list.filter(function (it) {
-            var hay = (String(it.siret || '') + ' ' + establishmentLabel(it)).toLowerCase().replace(/\s+/g, '');
-            return hay.indexOf(term) !== -1;
-        });
-    }
-
-    function establishmentAddress(it) {
-        var parts = [];
-        if (it.address1) parts.push(it.address1);
-        var cp = [it.postcode, it.city].filter(Boolean).join(' ');
-        if (cp) parts.push(cp);
-        return parts.join(', ');
-    }
-
-    function establishmentLabel(it) {
-        var siret = String(it.siret || '');
-        var pretty = siret.replace(/(\d{3})(\d{3})(\d{3})(\d{5})/, '$1 $2 $3 $4');
-        var label = pretty;
-        var addr = establishmentAddress(it);
-        if (addr) label += ' — ' + addr;
-        if (it.siege) label += ' (siège)';
-        if (it.closed) label += ' (fermé)';
-        return label;
-    }
-
-    function renderOptions(list) {
-        var select = getEtabSelect();
-        if (!select) return;
-        var previous = select.value;
-        select.innerHTML = '';
-
-        if (!list.length) {
-            var empty = document.createElement('option');
-            empty.value = '';
-            empty.textContent = 'Aucun établissement';
-            select.appendChild(empty);
-            return;
+        if (closed) {
+            var warn = document.createElement('div');
+            warn.className = 'snt-ip-siret-preview-warn';
+            warn.textContent = 'Établissement fermé à l\'INSEE.';
+            block.appendChild(warn);
         }
-
-        list.forEach(function (it) {
-            var opt = document.createElement('option');
-            opt.value = String(it.siret || '');
-            opt.textContent = establishmentLabel(it);
-            select.appendChild(opt);
-        });
-
-        // Conserver la sélection précédente si toujours présente.
-        if (previous && findBySiret(list, previous)) {
-            select.value = previous;
-        }
+        block.style.display = '';
     }
 
-    /**
-     * Alimente le <select> puis pré-sélectionne le meilleur établissement :
-     * le SIRET courant (édition) s'il est présent, sinon le premier (déjà trié
-     * côté serveur : siège en tête).
-     */
-    function renderEstablishments(list) {
-        establishmentsData = list || [];
-        var filter = getEtabFilter();
-        if (filter) {
-            filter.value = '';
-            filter.style.display = establishmentsData.length > FILTER_THRESHOLD ? '' : 'none';
-        }
-        renderOptions(establishmentsData);
-
-        var select = getEtabSelect();
-        if (!select) return;
-
-        var currentSiret = normalize((fieldByName('siret') || {}).value || '');
-        var preselect = (currentSiret && findBySiret(establishmentsData, currentSiret))
-            ? currentSiret
-            : (establishmentsData[0] ? establishmentsData[0].siret : '');
-
-        if (preselect) {
-            select.value = String(preselect);
-            applyEstablishmentSelection(findBySiret(establishmentsData, preselect));
-        }
-        showEtabUI(true);
+    function hideSiretPreview() {
+        var block = ensureSiretPreview();
+        if (block) { block.style.display = 'none'; block.innerHTML = ''; }
     }
 
-    function applyEstablishmentSelection(item) {
-        if (!item) return;
-        var siretInput   = fieldByName('siret');
+    // Reporte la raison sociale INSEE dans le champ `company` (autoritative si
+    // l'édition libre est interdite, à défaut on ne remplit que si vide).
+    function applySiretCompany(company) {
+        if (!company) return;
         var companyInput = fieldByName('company');
-
-        if (siretInput) {
-            siretInput.value = String(item.siret || '');
+        if (CFG.companyEditable) {
+            fillIfEmpty(companyInput, company);
+        } else {
+            forceFill(companyInput, company);
         }
-
-        if (item.company) {
-            if (CFG.companyEditable) {
-                fillIfEmpty(companyInput, item.company);
-            } else {
-                forceFill(companyInput, item.company);
-            }
-        }
-
-        // Le n° de TVA n'est plus auto-rempli (calcul mod-97 potentiellement
-        // erroné) : le client le saisit, VIES le validera.
-
-        var msg = '✓ ' + (item.company || 'Établissement sélectionné');
-        if (item.closed) msg += ' (établissement fermé à l\'INSEE)';
-        var addr = establishmentAddress(item);
-        if (addr) msg += ' — ' + addr;
-        setStatus(item.closed ? 'pending' : 'ok', msg);
     }
 
     // ------------------------------------------------------------------
@@ -599,13 +663,13 @@
     // ------------------------------------------------------------------
 
     function enterManualMode() {
-        establishmentsData = [];
-        showEtabUI(false);
-        setSiretMode('manual');
+        hideSiretPreview();
         unlockCompanyForManual();
-        // TVA non pré-remplie : saisie par le client, validée par VIES.
+        // SIRET localement valide mais non confirmé par l'INSEE : on laisse le
+        // champ éditable et requis ; la raison sociale devient saisissable.
         var siretInput = fieldByName('siret');
         if (siretInput) {
+            siretInput.removeAttribute('readonly');
             siretInput.setAttribute('required', 'required');
             siretInput.dataset.sntIpRequired = '1';
         }
@@ -620,41 +684,34 @@
     }
 
     // ------------------------------------------------------------------
-    // Appel AJAX (SIREN → établissements)
+    // Appel AJAX (SIRET → établissement INSEE)
     // ------------------------------------------------------------------
 
-    function handleSearchResponse(data, siren) {
+    function handleSiretResponse(data) {
         switch (data && data.status) {
-            case 'ok':
-                setStatus('ok', (data.company ? '✓ ' + data.company : '✓ Entreprise trouvée')
-                    + ' — ' + (data.total || (data.establishments || []).length) + ' établissement(s)'
-                    + (data.truncated ? ' (liste tronquée)' : ''));
-                if (data.company) {
-                    var companyInput = fieldByName('company');
-                    if (CFG.companyEditable) {
-                        fillIfEmpty(companyInput, data.company);
-                    } else {
-                        forceFill(companyInput, data.company);
-                    }
-                }
-                setSiretMode('hidden');
-                renderEstablishments(data.establishments || []);
+            case 'found':
+                applySiretCompany(data.company);
+                showSiretPreview(data.company, data.address, !!data.closed);
+                // L'aperçu porte déjà l'info : on garde la ligne de statut sobre
+                // (un simple avertissement si l'établissement est fermé).
+                setStatus(data.closed ? 'pending' : 'ok',
+                    data.closed ? 'Établissement fermé à l\'INSEE — vérifiez le SIRET.' : '');
                 break;
 
             case 'not_found':
-                showEtabUI(false);
-                setStatus('error', 'SIREN inconnu à l\'INSEE.');
+                hideSiretPreview();
+                setStatus('error', 'SIRET inconnu à l\'INSEE.');
                 break;
 
             case 'degraded':
             case 'unavailable':
-                setStatus('pending', 'Vérification INSEE indisponible — saisissez votre SIRET et votre raison sociale, ils seront vérifiés par nos équipes.');
+                setStatus('pending', 'Vérification INSEE indisponible — saisissez votre raison sociale, elle sera vérifiée par nos équipes.');
                 enterManualMode();
                 break;
 
             case 'invalid_format':
-                showEtabUI(false);
-                setStatus('error', 'SIREN invalide.');
+                hideSiretPreview();
+                setStatus('error', 'SIRET invalide.');
                 break;
 
             case 'rate_limited':
@@ -662,20 +719,20 @@
                 break;
 
             default:
-                setStatus('error', 'Impossible de vérifier le SIREN.');
+                setStatus('error', 'Impossible de vérifier le SIRET.');
         }
     }
 
-    function callSearch(siren) {
+    function callSiretLookup(siret) {
         // Mémorise l'appel en cours/effectué pour cette valeur : toute
-        // répétition du blur sur le même SIREN sera ignorée (cf. onSirenBlur).
-        lastSearchedSiren = siren;
+        // répétition du blur sur le même SIRET sera ignorée (cf. onSiretBlur).
+        lastSearchedSiret = siret;
         if (!CFG.validateUrl) {
-            setStatus('pending', 'SIREN localement valide (INSEE non configuré) — saisissez votre SIRET.');
+            setStatus('pending', 'SIRET localement valide (INSEE non configuré) — saisissez votre raison sociale.');
             enterManualMode();
             return;
         }
-        setStatus('pending', 'Recherche des établissements…');
+        setStatus('pending', 'Vérification du SIRET…');
         var xhr = new XMLHttpRequest();
         xhr.open('POST', CFG.validateUrl, true);
         xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
@@ -687,49 +744,310 @@
                 setStatus('error', 'Réponse serveur invalide.');
                 return;
             }
-            handleSearchResponse(data, siren);
+            handleSiretResponse(data);
         };
         xhr.onerror = function () { setStatus('error', 'Erreur réseau.'); };
-        xhr.send('siren=' + encodeURIComponent(siren) + '&ajax=1');
+        xhr.send('siret=' + encodeURIComponent(siret) + '&ajax=1');
     }
 
-    function onSirenBlur() {
-        var input = fieldByName('siren');
-        if (!input) return;
-        var siren = normalize(input.value);
-        if (siren === '') {
-            setStatus('', '');
-            return;
-        }
-        if (!isValidSirenLocal(siren)) {
-            setStatus('error', 'SIREN invalide (9 chiffres, clé Luhn).');
-            return;
-        }
-        input.value = siren;
-        if (siren === lastSearchedSiren) {
-            // Déjà interrogé pour cette valeur : pas de nouvel appel INSEE.
-            return;
-        }
-        callSearch(siren);
-    }
-
-    /**
-     * Blur SIRET en mode fallback manuel : validation locale + calcul TVA, sans
-     * appel INSEE (indisponible). La re-vérif serveur au submit fera foi.
-     */
-    function onSiretManualBlur() {
-        if (siretMode !== 'manual') return;
+    // Blur du SIRET (branche FR) : validation locale (Luhn) puis vérification
+    // INSEE (raison sociale + adresse d'aperçu). La re-vérif serveur au submit
+    // fait foi et crée l'adresse siège.
+    function onSiretBlur() {
+        if (!isProChecked() || !isFrCountry()) { return; }
         var input = fieldByName('siret');
         if (!input) return;
         var siret = normalize(input.value);
-        if (siret === '') return;
+        if (siret === '') {
+            setStatus('', '');
+            hideSiretPreview();
+            return;
+        }
         if (!isValidSiretLocal(siret)) {
+            hideSiretPreview();
             setStatus('error', 'SIRET invalide (14 chiffres, clé Luhn).');
             return;
         }
         input.value = siret;
-        // TVA non pré-remplie (calcul mod-97 potentiellement erroné) : saisie
-        // par le client, validée par VIES.
+        // Pré-remplit l'adresse de facturation électronique (SIREN) et le n° de
+        // TVA intracom. calculé, tous deux modifiables ensuite par le client.
+        syncEinvoicingFromSiret();
+        syncVatFromSiret();
+        if (siret === lastSearchedSiret) {
+            // Déjà interrogé pour cette valeur : pas de nouvel appel INSEE.
+            return;
+        }
+        callSiretLookup(siret);
+    }
+
+    // ------------------------------------------------------------------
+    // Recherche d'établissement par raison sociale + code postal
+    // ------------------------------------------------------------------
+    // Alternative à la saisie directe du SIRET : le client cherche par nom + code
+    // postal, choisit son établissement dans une liste, et la sélection renseigne
+    // le SIRET (source de vérité) puis déclenche l'aperçu et les auto-remplissages
+    // habituels (raison sociale, TVA, AFE). Le SIRET reste re-vérifié au submit.
+
+    var searchData = []; // derniers établissements reçus (pour la sélection)
+
+    function siretMode() {
+        var checked = document.querySelector('input[name="snt_ip_siret_mode"]:checked');
+        return checked ? checked.value : 'siret';
+    }
+
+    function findBySiret(list, siret) {
+        for (var i = 0; i < list.length; i++) {
+            if (String(list[i].siret) === String(siret)) { return list[i]; }
+        }
+        return null;
+    }
+
+    // Construit (une seule fois) le sélecteur de mode + le bloc de recherche.
+    // Insérés dans LA COLONNE du champ SIRET (et non dans la ligne .form-group)
+    // pour s'aligner sur la largeur des autres champs — les thèmes disposent la
+    // ligne en grille (libellé | champ), un enfant direct de la ligne s'étirerait
+    // sur toute la largeur. Renvoie le bloc de recherche.
+    function ensureSearchUI() {
+        var siretInput = fieldByName('siret');
+        var col = inlineContainerOf(siretInput);
+        if (!col) { return null; }
+        var existing = col.querySelector('.snt-ip-rs-search');
+        if (existing) { return existing; }
+
+        // -- Sélecteur de mode (2 boutons radio) --
+        var modes = document.createElement('div');
+        modes.className = 'snt-ip-siret-mode';
+        modes.innerHTML =
+            '<label class="snt-ip-siret-mode-opt">' +
+              '<input type="radio" name="snt_ip_siret_mode" value="siret" checked> ' +
+              'Je connais mon SIRET' +
+            '</label>' +
+            '<label class="snt-ip-siret-mode-opt">' +
+              '<input type="radio" name="snt_ip_siret_mode" value="search"> ' +
+              'Rechercher par raison sociale + code postal' +
+            '</label>';
+
+        // -- Bloc de recherche --
+        var block = document.createElement('div');
+        block.className = 'snt-ip-rs-search';
+        block.style.display = 'none';
+
+        var rs = document.createElement('input');
+        rs.type = 'text';
+        rs.className = 'form-control snt-ip-rs-name';
+        rs.placeholder = 'Raison sociale';
+
+        var cp = document.createElement('input');
+        cp.type = 'text';
+        cp.className = 'form-control snt-ip-rs-cp';
+        cp.placeholder = 'Code postal';
+        cp.setAttribute('inputmode', 'numeric');
+        cp.maxLength = 5;
+        cp.addEventListener('input', function () {
+            cp.value = cp.value.replace(/\D+/g, '').slice(0, 5);
+        });
+        // Entrée dans un champ -> lance la recherche.
+        function onEnter(e) { if (e.key === 'Enter') { e.preventDefault(); onNameSearchClick(); } }
+        rs.addEventListener('keydown', onEnter);
+        cp.addEventListener('keydown', onEnter);
+
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-secondary snt-ip-rs-btn';
+        btn.textContent = 'Rechercher';
+        btn.addEventListener('click', onNameSearchClick);
+
+        var results = document.createElement('select');
+        results.className = 'form-control snt-ip-rs-results';
+        results.style.display = 'none';
+        results.addEventListener('change', function () {
+            selectEstablishment(findBySiret(searchData, results.value));
+        });
+
+        block.appendChild(rs);
+        block.appendChild(cp);
+        block.appendChild(btn);
+        block.appendChild(results);
+
+        // Insertion dans la colonne, juste avant l'input SIRET : le sélecteur de
+        // mode d'abord, puis le bloc de recherche, puis l'input (et l'aperçu).
+        col.insertBefore(block, siretInput);
+        col.insertBefore(modes, block);
+
+        Array.prototype.forEach.call(
+            modes.querySelectorAll('input[name="snt_ip_siret_mode"]'),
+            function (r) {
+                r.addEventListener('change', function () {
+                    hideSiretPreview();
+                    setStatus('', '');
+                    applySiretMode();
+                });
+            }
+        );
+
+        return block;
+    }
+
+    // Applique le mode courant (SIRET direct vs recherche) : visibilité de l'input
+    // SIRET / du bloc de recherche + gestion du `required`. FR pro uniquement.
+    // La colonne du champ et son libellé restent visibles : ils portent le
+    // sélecteur de mode, le bloc de recherche et l'aperçu.
+    function applySiretMode() {
+        if (!isProChecked() || !isFrCountry()) { return; }
+        var block = ensureSearchUI();
+        var searching = (siretMode() === 'search');
+        var siret = fieldByName('siret');
+
+        if (block) { block.style.display = searching ? '' : 'none'; }
+
+        if (siret) {
+            // En mode recherche, on masque uniquement l'input SIRET (renseigné par
+            // la sélection d'un établissement).
+            siret.style.display = searching ? 'none' : '';
+            if (searching) {
+                siret.setAttribute('readonly', 'readonly');
+                // Requis uniquement si un établissement a déjà été choisi : un champ
+                // requis vide ET masqué bloquerait la soumission (non focusable). Le
+                // serveur exige le SIRET dans tous les cas (validateFrenchPro).
+                if (normalize(siret.value) === '') {
+                    siret.removeAttribute('required');
+                    siret.dataset.sntIpRequired = '';
+                } else {
+                    siret.setAttribute('required', 'required');
+                    siret.dataset.sntIpRequired = '1';
+                }
+            } else {
+                siret.removeAttribute('readonly');
+                siret.setAttribute('required', 'required');
+                siret.dataset.sntIpRequired = '1';
+            }
+        }
+    }
+
+    // Libellé d'un établissement dans le <select> de résultats.
+    function establishmentLabel(it) {
+        var siret = String(it.siret || '');
+        var pretty = siret.replace(/(\d{3})(\d{3})(\d{3})(\d{5})/, '$1 $2 $3 $4');
+        var parts = [pretty];
+        if (it.company) { parts.push(it.company); }
+        var addr = [it.address1, [it.postcode, it.city].filter(Boolean).join(' ')]
+            .filter(Boolean).join(', ');
+        if (addr) { parts.push(addr); }
+        var label = parts.join(' — ');
+        if (it.siege) { label += ' (siège)'; }
+        if (it.closed) { label += ' (fermé)'; }
+        return label;
+    }
+
+    function renderSearchResults(list) {
+        searchData = list || [];
+        var block = ensureSearchUI();
+        var select = block ? block.querySelector('.snt-ip-rs-results') : null;
+        if (!select) { return; }
+        select.innerHTML = '';
+        if (!searchData.length) { select.style.display = 'none'; return; }
+
+        var ph = document.createElement('option');
+        ph.value = '';
+        ph.textContent = '— Choisissez votre établissement —';
+        select.appendChild(ph);
+
+        searchData.forEach(function (it) {
+            var opt = document.createElement('option');
+            opt.value = String(it.siret || '');
+            opt.textContent = establishmentLabel(it);
+            select.appendChild(opt);
+        });
+        select.value = '';
+        select.style.display = '';
+    }
+
+    // Sélection d'un établissement : renseigne le SIRET (autoritatif) et déclenche
+    // l'aperçu + les auto-remplissages, sans nouvel appel INSEE (données déjà là).
+    function selectEstablishment(item) {
+        if (!item) { return; }
+        var siret = fieldByName('siret');
+        if (siret) {
+            siret.value = String(item.siret || '');
+            siret.setAttribute('required', 'required');
+            siret.dataset.sntIpRequired = '1';
+            // Évite un re-lookup au blur si l'input SIRET reçoit le focus.
+            lastSearchedSiret = normalize(siret.value);
+        }
+        applySiretCompany(item.company);
+        showSiretPreview(item.company, {
+            address1: item.address1,
+            address2: item.address2,
+            postcode: item.postcode,
+            city: item.city
+        }, !!item.closed);
+        syncEinvoicingFromSiret();
+        syncVatFromSiret();
+        setStatus(item.closed ? 'pending' : 'ok',
+            item.closed ? 'Établissement fermé à l\'INSEE — vérifiez votre choix.' : '');
+    }
+
+    function handleNameSearchResponse(data) {
+        switch (data && data.status) {
+            case 'list':
+                renderSearchResults(data.establishments || []);
+                var n = data.total || (data.establishments || []).length;
+                if (n === 0) {
+                    setStatus('error', 'Aucun établissement trouvé.');
+                } else {
+                    setStatus('ok', n + ' établissement(s) trouvé(s)'
+                        + (data.truncated ? ' (liste tronquée)' : '')
+                        + ' — choisissez le vôtre.');
+                }
+                break;
+
+            case 'not_found':
+                renderSearchResults([]);
+                setStatus('error', 'Aucun établissement trouvé pour cette raison sociale et ce code postal.');
+                break;
+
+            case 'invalid_format':
+                setStatus('error', 'Renseignez une raison sociale et un code postal (5 chiffres).');
+                break;
+
+            case 'rate_limited':
+                setStatus('error', 'Trop de tentatives, merci de patienter quelques instants.');
+                break;
+
+            case 'unavailable':
+            default:
+                setStatus('pending', 'Recherche INSEE indisponible — saisissez votre SIRET directement.');
+        }
+    }
+
+    function onNameSearchClick() {
+        var block = ensureSearchUI();
+        if (!block) { return; }
+        var rs = block.querySelector('.snt-ip-rs-name');
+        var cp = block.querySelector('.snt-ip-rs-cp');
+        var name = String((rs && rs.value) || '').trim();
+        var post = String((cp && cp.value) || '').replace(/\D+/g, '');
+        if (name.length < 2 || post.length !== 5) {
+            setStatus('error', 'Renseignez une raison sociale (2 caractères min.) et un code postal (5 chiffres).');
+            return;
+        }
+        if (!CFG.validateUrl) {
+            setStatus('pending', 'Recherche INSEE non configurée — saisissez votre SIRET.');
+            return;
+        }
+        setStatus('pending', 'Recherche en cours…');
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', CFG.validateUrl, true);
+        xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
+        xhr.onload = function () {
+            var data = null;
+            try { data = JSON.parse(xhr.responseText); } catch (e) {}
+            if (!data) { setStatus('error', 'Réponse serveur invalide.'); return; }
+            handleNameSearchResponse(data);
+        };
+        xhr.onerror = function () { setStatus('error', 'Erreur réseau.'); };
+        xhr.send('rs=' + encodeURIComponent(name) + '&cp=' + encodeURIComponent(post) + '&ajax=1');
     }
 
     // ------------------------------------------------------------------
@@ -745,6 +1063,41 @@
     }
 
     // ------------------------------------------------------------------
+    // Info-bulles (pastille « ? » à gauche de certains libellés)
+    // ------------------------------------------------------------------
+
+    // Insère une pastille « ? » (fond bleu clair) au début du libellé du champ
+    // `name`, avec une bulle affichée au survol/focus. Le texte de la bulle est
+    // fourni via `text` (laissé vide par défaut : la bulle reste masquée tant
+    // qu'aucun texte n'est renseigné — cf. `.snt-ip-tooltip-popup:empty` en CSS).
+    // Idempotent : n'ajoute rien si la pastille est déjà présente.
+    function addFieldTooltip(name, text) {
+        var wrapper = wrapperOf(fieldByName(name));
+        if (!wrapper) { return; }
+        var label = wrapper.querySelector('label');
+        if (!label || label.querySelector('.snt-ip-tooltip')) { return; }
+
+        var tip = document.createElement('span');
+        tip.className = 'snt-ip-tooltip';
+
+        var icon = document.createElement('span');
+        icon.className = 'snt-ip-tooltip-icon';
+        icon.textContent = '?';
+        icon.setAttribute('tabindex', '0');
+        icon.setAttribute('role', 'button');
+        icon.setAttribute('aria-label', 'Aide');
+
+        var popup = document.createElement('span');
+        popup.className = 'snt-ip-tooltip-popup';
+        popup.setAttribute('role', 'tooltip');
+        popup.textContent = text || '';
+
+        tip.appendChild(icon);
+        tip.appendChild(popup);
+        label.insertBefore(tip, label.firstChild);
+    }
+
+    // ------------------------------------------------------------------
     // Bootstrap
     // ------------------------------------------------------------------
 
@@ -754,29 +1107,32 @@
 
         removeDuplicateFields();
         reorderFields();
+        setupSectionTitles();
         applyCompanyReadonly();
 
-        // État initial du SIRET : édition (valeur existante) → lecture seule
-        // visible ; création → masqué (piloté par la sélection).
-        var existingSiret = normalize((fieldByName('siret') || {}).value || '');
-        setSiretMode(existingSiret !== '' ? 'readonly' : 'hidden');
+        // Info-bulles « ? » à gauche des libellés (texte à renseigner : passer le
+        // contenu en 2ᵉ argument, ex. addFieldTooltip('accounting_email', '…')).
+        addFieldTooltip('accounting_email', 'Facultatif, ce champ permet à notre système d\'envoyer également les factures à cette adresse mail.');
+        addFieldTooltip('einvoicing_address', 'Suite à la réforme de la facturation électronique, il est désormais nécessaire de recueillir l\'adresse de facturation électronique.');
 
+        // Le SIRET est le point d'entrée du parcours FR : sa visibilité et son
+        // caractère requis sont pilotés par applyBranch (via applyVisibility).
         applyVisibility(isProChecked());
 
         radios.forEach(function (r) {
             r.addEventListener('change', function () { applyVisibility(isProChecked()); });
         });
 
-        var sirenInput = fieldByName('siren');
-        if (sirenInput) {
-            sirenInput.addEventListener('blur', onSirenBlur);
-            // Toute édition du SIREN réarme la recherche (permet un nouvel essai,
-            // ex. après un rate-limit, ou pour corriger une saisie).
-            sirenInput.addEventListener('input', function () { lastSearchedSiren = ''; });
-        }
         var siretInput = fieldByName('siret');
         if (siretInput) {
-            siretInput.addEventListener('blur', onSiretManualBlur);
+            siretInput.addEventListener('blur', onSiretBlur);
+            // Toute édition du SIRET réarme la recherche (permet un nouvel essai,
+            // ex. après un rate-limit, ou pour corriger une saisie) et masque
+            // l'aperçu tant que le nouveau SIRET n'est pas revérifié.
+            siretInput.addEventListener('input', function () {
+                lastSearchedSiret = '';
+                hideSiretPreview();
+            });
         }
 
         // Sélecteur pays : bascule la branche FR / non-FR.
@@ -790,5 +1146,141 @@
         if (vatInput) {
             vatInput.addEventListener('blur', onVatBlur);
         }
+
+        // Adresse de facturation électronique : auto-remplie depuis le SIRET tant
+        // que le client n'y a pas touché. Toute saisie manuelle pose le drapeau
+        // `sntIpTouched` pour ne plus jamais l'écraser. Une valeur déjà présente au
+        // chargement (édition d'un compte) est d'emblée considérée « modifiée »,
+        // pour préserver l'AFE enregistrée.
+        var einvInput = fieldByName('einvoicing_address');
+        if (einvInput) {
+            if (String(einvInput.value || '').trim() !== '') {
+                einvInput.dataset.sntIpTouched = '1';
+            }
+            einvInput.addEventListener('input', function () {
+                einvInput.dataset.sntIpTouched = '1';
+            });
+        }
+
+        // N° de TVA intracom. : même logique que l'AFE — auto-rempli (calcul FR)
+        // depuis le SIRET tant que le client n'y a pas touché ; une valeur déjà
+        // présente au chargement (édition, ou saisie non-FR) est préservée.
+        var vatFieldInput = fieldByName('vatNumber');
+        if (vatFieldInput) {
+            if (String(vatFieldInput.value || '').trim() !== '') {
+                vatFieldInput.dataset.sntIpTouched = '1';
+            }
+            vatFieldInput.addEventListener('input', function () {
+                vatFieldInput.dataset.sntIpTouched = '1';
+            });
+        }
+
+        // Le passage Professionnel ↔ Administration (radio « Type de compte ») est
+        // capté par le listener `change` des radios `is_pro` ci-dessus, qui relance
+        // applyVisibility -> applyBranch -> applyEinvoicingAdminState (masque/affiche
+        // l'AFE et ajuste son caractère requis). Aucun listener dédié nécessaire.
+    });
+
+    // ------------------------------------------------------------------
+    // Garde « caractères spéciaux » (ticket 12063)
+    // ------------------------------------------------------------------
+    // Bloque la soumission si un champ contient des caractères non autorisés.
+    // Repris de l'ancien script du thème (customer-form.tpl), mais adapté au
+    // module :
+    //  - regex corrigées par champ (le SIRET est NUMÉRIQUE — l'ancienne regex
+    //    interdisait les chiffres et bloquait donc tous les pros) ;
+    //  - on IGNORE les champs `readonly`/`disabled`/masqués : leur valeur est
+    //    maîtrisée par le module (raison sociale INSEE, SIRET Luhn) et non
+    //    librement saisie ; un champ non éditable en erreur bloquerait la
+    //    soumission sans recours ;
+    //  - aucune dépendance à des id du thème (#submitBtn / #chars-alert) : on
+    //    s'appuie sur la validation HTML5 native (setCustomValidity) + un
+    //    message injecté par le module, et on revalide au submit (capte les
+    //    remplissages programmatiques qui n'émettent pas d'événement `input`).
+    var CHAR_RULES = {
+        firstname: /^[a-zA-ZÀ-ÿ\s'\-]*$/,
+        lastname:  /^[a-zA-ZÀ-ÿ\s'\-]*$/,
+        email:     /^[a-zA-Z0-9._%+\-@]*$/,
+        // Raison sociale : jeu élargi (ce que l'INSEE peut renvoyer en saisie
+        // manuelle) — lettres/chiffres/accents + espaces ' - . & , ( ) /.
+        company:   /^[a-zA-Z0-9À-ÿ\s'\-.&,()\/]*$/,
+        // SIRET : chiffres et espaces uniquement.
+        siret:     /^[0-9\s]*$/
+    };
+    var CHAR_MSG = 'Ce champ contient des caractères non autorisés.';
+
+    function guardedFields() {
+        var out = [];
+        Object.keys(CHAR_RULES).forEach(function (name) {
+            var el = fieldByName(name);
+            if (el) { out.push({ name: name, el: el }); }
+        });
+        return out;
+    }
+
+    // Un champ non éditable (lecture seule / désactivé) ou masqué n'est pas
+    // soumis à la saisie de l'utilisateur : on ne le contrôle pas.
+    function isGuardable(el) {
+        return !el.readOnly && !el.disabled && el.offsetParent !== null;
+    }
+
+    function ensureCharAlert(form) {
+        var el = document.getElementById('snt-ip-chars-alert');
+        if (el) { return el; }
+        el = document.createElement('div');
+        el.id = 'snt-ip-chars-alert';
+        el.className = 'snt-ip-chars-alert';
+        el.setAttribute('role', 'alert');
+        el.style.display = 'none';
+        el.textContent = CHAR_MSG;
+        form.insertBefore(el, form.firstChild);
+        return el;
+    }
+
+    function validateChars(form) {
+        var hasError = false;
+        guardedFields().forEach(function (f) {
+            var el = f.el;
+            if (!isGuardable(el)) {
+                el.classList.remove('snt-ip-charerror');
+                el.setCustomValidity('');
+                return;
+            }
+            if (CHAR_RULES[f.name].test(el.value || '')) {
+                el.classList.remove('snt-ip-charerror');
+                el.setCustomValidity('');
+            } else {
+                hasError = true;
+                el.classList.add('snt-ip-charerror');
+                el.setCustomValidity(CHAR_MSG);
+            }
+        });
+        var alert = ensureCharAlert(form);
+        alert.style.display = hasError ? 'block' : 'none';
+        return !hasError;
+    }
+
+    ready(function () {
+        var fields = guardedFields();
+        if (!fields.length) { return; }
+        var form = fields[0].el.form || fields[0].el.closest('form');
+        if (!form) { return; }
+
+        fields.forEach(function (f) {
+            f.el.addEventListener('input', function () { validateChars(form); });
+            f.el.addEventListener('blur', function () { validateChars(form); });
+        });
+
+        // Filet au submit : revalide même les valeurs posées programmatiquement
+        // (INSEE/VIES) qui n'ont pas déclenché d'événement `input`.
+        form.addEventListener('submit', function (e) {
+            if (!validateChars(form)) {
+                e.preventDefault();
+                var firstBad = form.querySelector('.snt-ip-charerror');
+                if (firstBad) { firstBad.focus(); }
+            }
+        });
+
+        validateChars(form);
     });
 })();

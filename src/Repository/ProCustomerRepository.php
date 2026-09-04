@@ -40,37 +40,99 @@ final class ProCustomerRepository
     }
 
     /**
+     * Vue destinée à l'endpoint API (ERP / n8n) : données pro du module
+     * enrichies de `company` et `siret` issus de la fiche client PrestaShop
+     * (`ps_customer`). Retourne null si aucune ligne pro n'existe pour ce client.
+     *
+     * @return array{vatNumber:?string,afe:?string,accounting_email:?string,einvoicing_address:?string,is_administration:int,company:?string,siret:?string}|null
+     */
+    public function findApiViewByCustomer(int $idCustomer): ?array
+    {
+        if ($idCustomer <= 0) {
+            return null;
+        }
+        $q = new DbQuery();
+        $q->select('p.vatNumber, p.afe, p.accounting_email, p.einvoicing_address, p.is_administration, c.company, c.siret')
+            ->from(self::TABLE, 'p')
+            ->leftJoin('customer', 'c', 'c.id_customer = p.id_customer')
+            ->where('p.id_customer = ' . $idCustomer);
+        // `Db::getRow()` ajoute lui-même le `LIMIT 1` (cf. findByCustomer).
+        $row = $this->db->getRow($q);
+        return $row ?: null;
+    }
+
+    /**
+     * Version batch de findApiViewByCustomer : renvoie une ligne par client
+     * trouvé (les id sans données pro sont simplement absents du résultat).
+     * Chaque ligne inclut `id_customer` pour permettre le mapping côté appelant.
+     * Les id sont castés en entiers -> pas de risque d'injection sur le `IN`.
+     *
+     * @param int[] $idCustomers
+     * @return array<int,array<string,mixed>>
+     */
+    public function findApiViewByCustomers(array $idCustomers): array
+    {
+        $ids = array_values(array_unique(array_filter(
+            array_map('intval', $idCustomers),
+            static function ($i) { return $i > 0; }
+        )));
+        if (empty($ids)) {
+            return [];
+        }
+
+        $q = new DbQuery();
+        $q->select('p.id_customer, p.vatNumber, p.afe, p.accounting_email, p.einvoicing_address, p.is_administration, c.company, c.siret')
+            ->from(self::TABLE, 'p')
+            ->leftJoin('customer', 'c', 'c.id_customer = p.id_customer')
+            ->where('p.id_customer IN (' . implode(',', $ids) . ')');
+
+        $rows = $this->db->executeS($q);
+
+        return is_array($rows) ? $rows : [];
+    }
+
+    /**
      * Upsert atomique sur (id_customer). Retourne true si l'écriture a réussi.
      *
      * @param bool        $needsReview     Marque le compte « à vérifier » (INSEE
      *                                     indisponible au moment de la création →
      *                                     raison sociale non authentifiée).
-     * @param string|null $accountingEmail Email du service comptable (demande
-     *                                     compta), exposé à l'ERP via l'endpoint API.
+     * @param string|null $accountingEmail   Email du service comptable (demande
+     *                                       compta), exposé à l'ERP via l'endpoint API.
+     * @param string|null $einvoicingAddress Adresse de facturation électronique
+     *                                       (réforme facturation électronique) :
+     *                                       SIRET dans la majorité des cas, ou un
+     *                                       autre identifiant de routage. Exposée
+     *                                       à l'ERP via l'endpoint API.
      */
     public function upsert(
         int $idCustomer,
         ?string $vatNumber,
         ?string $afe,
         bool $needsReview = false,
-        ?string $accountingEmail = null
+        ?string $accountingEmail = null,
+        ?string $einvoicingAddress = null,
+        bool $isAdministration = false
     ): bool {
         if ($idCustomer <= 0) {
             return false;
         }
-        $vat   = $vatNumber       !== null ? pSQL($vatNumber)       : null;
-        $af    = $afe             !== null ? pSQL($afe)             : null;
-        $email = $accountingEmail !== null ? pSQL($accountingEmail) : null;
+        $vat   = $vatNumber         !== null ? pSQL($vatNumber)         : null;
+        $af    = $afe               !== null ? pSQL($afe)               : null;
+        $email = $accountingEmail   !== null ? pSQL($accountingEmail)   : null;
+        $einv  = $einvoicingAddress !== null ? pSQL($einvoicingAddress) : null;
         $now   = date('Y-m-d H:i:s');
 
         $existing = $this->findByCustomer($idCustomer);
         if ($existing) {
             $data = [
-                'vatNumber'        => $vat,
-                'afe'              => $af,
-                'accounting_email' => $email,
-                'needs_review'     => $needsReview ? 1 : 0,
-                'date_upd'         => $now,
+                'vatNumber'          => $vat,
+                'afe'                => $af,
+                'accounting_email'   => $email,
+                'einvoicing_address' => $einv,
+                'is_administration'  => $isAdministration ? 1 : 0,
+                'needs_review'       => $needsReview ? 1 : 0,
+                'date_upd'           => $now,
             ];
             return (bool) $this->db->update(
                 self::TABLE,
@@ -81,13 +143,15 @@ final class ProCustomerRepository
         }
 
         return (bool) $this->db->insert(self::TABLE, [
-            'id_customer'      => $idCustomer,
-            'vatNumber'        => $vat,
-            'afe'              => $af,
-            'accounting_email' => $email,
-            'needs_review'     => $needsReview ? 1 : 0,
-            'date_add'         => $now,
-            'date_upd'         => $now,
+            'id_customer'        => $idCustomer,
+            'vatNumber'          => $vat,
+            'afe'                => $af,
+            'accounting_email'   => $email,
+            'einvoicing_address' => $einv,
+            'is_administration'  => $isAdministration ? 1 : 0,
+            'needs_review'       => $needsReview ? 1 : 0,
+            'date_add'           => $now,
+            'date_upd'           => $now,
         ]);
     }
 
@@ -102,7 +166,7 @@ final class ProCustomerRepository
         $limit = max(1, min($limit, 500));
 
         $q = new DbQuery();
-        $q->select('p.id_customer, p.vatNumber, p.afe, p.accounting_email, p.date_upd, c.firstname, c.lastname, c.email, c.company, c.siret')
+        $q->select('p.id_customer, p.vatNumber, p.afe, p.accounting_email, p.einvoicing_address, p.date_upd, c.firstname, c.lastname, c.email, c.company, c.siret')
             ->from(self::TABLE, 'p')
             ->leftJoin('customer', 'c', 'c.id_customer = p.id_customer')
             ->where('p.needs_review = 1')

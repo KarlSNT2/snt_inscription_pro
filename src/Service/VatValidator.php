@@ -27,7 +27,7 @@ final class VatValidator
      */
     private const PATTERNS = [
         'AT' => '/^U[A-Z0-9]{8}$/',
-        'BE' => '/^0\d{9}$/',
+        'BE' => '/^[01]\d{9}$/',
         'BG' => '/^\d{9,10}$/',
         'CY' => '/^\d{8}[A-Z]$/',
         'CZ' => '/^\d{8,10}$/',

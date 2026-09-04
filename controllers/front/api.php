@@ -7,17 +7,24 @@ use SNT\InscriptionPro\Repository\ProCustomerRepository;
 use SNT\InscriptionPro\Service\Logger;
 
 /**
- * Endpoint REST en lecture seule : renvoie `vatNumber`, `afe` et
- * `accounting_email` pour un `id_customer` donné. Consommé par un ERP / n8n externe.
+ * Endpoint REST en lecture seule : renvoie `vatNumber`, `afe`,
+ * `accounting_email`, `einvoicing_address` (table module) ainsi que `company`
+ * et `siret` (fiche client `ps_customer`) pour un `id_customer` donné.
+ * Consommé par un ERP / n8n externe.
  *
- * `siret` et `company` ne sont volontairement PAS exposés ici : ils sont déjà
- * couverts par le webservice PrestaShop natif.
+ * Deux modes selon `id_customer` :
+ *  - un id seul (`...&id_customer=42`)        -> objet JSON unique ;
+ *  - une liste (`...&id_customer=23,57,75`)   -> tableau JSON d'objets (batch),
+ *    limité à MAX_BATCH ids, seuls les clients trouvés sont renvoyés.
  *
  * URL : /index.php?fc=module&module=snt_inscription_pro&controller=api&id_customer=42
  * Auth : header `X-Api-Key`. HTTPS obligatoire. Allowlist IP optionnelle.
  */
 class Snt_inscription_proApiModuleFrontController extends ModuleFrontController
 {
+    /** Nombre maximum d'id_customer acceptés en une requête batch. */
+    private const MAX_BATCH = 200;
+
     public $ajax = true;
     public $auth = false;
     public $ssl = true;
@@ -53,22 +60,79 @@ class Snt_inscription_proApiModuleFrontController extends ModuleFrontController
             $this->json(401, ['error' => 'unauthorized'], false, null, $ip, 'Clé API absente ou invalide');
         }
 
-        $idCustomer = (int) Tools::getValue('id_customer', 0);
+        $raw = trim((string) Tools::getValue('id_customer', ''));
+
+        // Mode BATCH : `id_customer` contient une liste séparée par des virgules
+        // (ex. `23,57,75`) -> réponse = tableau d'objets (uniquement les clients
+        // trouvés). Mode SIMPLE (un id, sans virgule) -> réponse = objet unique
+        // (rétrocompatibilité stricte de l'ancien contrat).
+        if (strpos($raw, ',') !== false) {
+            $this->respondBatch($raw, $ip);
+        }
+
+        $idCustomer = (int) $raw;
         if ($idCustomer <= 0) {
             $this->json(400, ['error' => 'invalid_id_customer'], false, null, $ip, 'id_customer manquant ou invalide');
         }
 
-        $row = (new ProCustomerRepository())->findByCustomer($idCustomer);
+        $row = (new ProCustomerRepository())->findApiViewByCustomer($idCustomer);
         if ($row === null) {
             $this->json(404, ['error' => 'not_found'], false, $idCustomer, $ip, 'Aucune donnée pro pour ce client');
         }
 
-        $this->json(200, [
-            'id_customer'      => $idCustomer,
-            'vatNumber'        => isset($row['vatNumber']) && $row['vatNumber'] !== null ? (string) $row['vatNumber'] : null,
-            'afe'              => isset($row['afe']) && $row['afe'] !== null ? (string) $row['afe'] : null,
-            'accounting_email' => isset($row['accounting_email']) && $row['accounting_email'] !== null ? (string) $row['accounting_email'] : null,
-        ], true, $idCustomer, $ip, 'Accès autorisé');
+        $row['id_customer'] = $idCustomer;
+        $this->json(200, $this->formatRow($row), true, $idCustomer, $ip, 'Accès autorisé');
+    }
+
+    /**
+     * Mode batch : renvoie un tableau JSON d'objets pour une liste d'id_customer.
+     * Seuls les clients possédant des données pro sont présents (les manquants
+     * sont simplement omis). 200 même si certains — ou tous — sont absents.
+     *
+     * @return never
+     */
+    private function respondBatch(string $raw, string $ip): void
+    {
+        $ids = array_values(array_unique(array_filter(
+            array_map('intval', explode(',', $raw)),
+            static function ($i) { return $i > 0; }
+        )));
+
+        if (empty($ids)) {
+            $this->json(400, ['error' => 'invalid_id_customer'], false, null, $ip, 'Liste id_customer vide ou invalide');
+        }
+        if (count($ids) > self::MAX_BATCH) {
+            $this->json(400, ['error' => 'too_many_ids', 'max' => self::MAX_BATCH], false, null, $ip, 'Trop d\'id_customer (max ' . self::MAX_BATCH . ')');
+        }
+
+        $rows = (new ProCustomerRepository())->findApiViewByCustomers($ids);
+
+        $out = [];
+        foreach ($rows as $row) {
+            $out[] = $this->formatRow($row);
+        }
+
+        $this->json(200, $out, true, null, $ip, 'Accès autorisé (batch ' . count($out) . '/' . count($ids) . ')');
+    }
+
+    /**
+     * Normalise une ligne repository en objet de réponse API.
+     *
+     * @param array<string,mixed> $row
+     * @return array<string,mixed>
+     */
+    private function formatRow(array $row): array
+    {
+        return [
+            'id_customer'        => (int) ($row['id_customer'] ?? 0),
+            'vatNumber'          => $this->str($row, 'vatNumber'),
+            'afe'                => $this->str($row, 'afe'),
+            'accounting_email'   => $this->str($row, 'accounting_email'),
+            'einvoicing_address' => $this->str($row, 'einvoicing_address'),
+            'is_administration'  => (bool) ($row['is_administration'] ?? false),
+            'company'            => $this->str($row, 'company'),
+            'siret'              => $this->str($row, 'siret'),
+        ];
     }
 
     private function isHttps(): bool
@@ -106,6 +170,16 @@ class Snt_inscription_proApiModuleFrontController extends ModuleFrontController
         }
 
         return '';
+    }
+
+    /**
+     * Normalise une valeur de la ligne en chaîne exposable (ou null si absente).
+     *
+     * @param array<string,mixed> $row
+     */
+    private function str(array $row, string $key): ?string
+    {
+        return isset($row[$key]) && $row[$key] !== null ? (string) $row[$key] : null;
     }
 
     /**
