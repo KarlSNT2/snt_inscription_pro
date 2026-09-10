@@ -114,7 +114,10 @@ Variables exposées au JS via `Media::addJsDef` :
   - Override `init()` pour court-circuiter le cycle front, `hash_equals(SNT_IP_API_KEY, header('X-Api-Key'))`.
   - Contrôle HTTPS (`Tools::usingSecureMode()` ou `HTTP_X_FORWARDED_PROTO === 'https'`).
   - Allowlist IP (`SNT_IP_API_IP_ALLOWLIST`, CSV).
-  - Sortie JSON stricte `{id_customer, vatNumber, afe}`, codes `200/400/401/403/404`.
+  - Sortie JSON stricte `{id_customer, vatNumber, afe}`, codes `200/400/401/403/500`.
+  - Mode simple, client sans données pro : `200 []` (et non `404`), par cohérence
+    avec le mode batch. Le `404 not_found` n'est plus émis (un vide n'est pas une
+    erreur HTTP) — les consommateurs testent le corps vide.
   - Test `curl` documenté.
 
 - **Phase 4 — Finition** :
@@ -136,7 +139,7 @@ Variables exposées au JS via `Media::addJsDef` :
 
 **Fallback INSEE** — le verrou serveur de `company` n'est plus inconditionnel : il ne s'applique que quand l'INSEE confirme (`STATUS_FOUND`). Si l'INSEE est indisponible (401/403/429/timeout) ou renvoie `NOT_FOUND` en mode non-strict, le compte est accepté avec la raison sociale **saisie manuellement** (le JS déverrouille `company`), marqué `needs_review=1` (colonne ajoutée sur la table module) + log `account_degraded`. Pour les incidents d'infra, `MailAlerter` envoie une alerte au support (`SNT_IP_SUPPORT_EMAIL`, fallback `PS_SHOP_EMAIL`), **throttlée** à 1 mail / `SNT_IP_ALERT_THROTTLE` s (défaut 1 h). Templates dans `mails/{fr,en}/snt_insee_alert.{html,txt}`.
 
-**Endpoint API** — `controllers/front/api.php` : override `init()` (sortie JSON directe + `exit`), auth `hash_equals` sur header `X-Api-Key`, HTTPS obligatoire (`Tools::usingSecureMode()` ou `HTTP_X_FORWARDED_PROTO`), allowlist IP CSV, sortie `{id_customer, vatNumber, afe}`, codes `200/400/401/403/404/500`, log `api_access`.
+**Endpoint API** — `controllers/front/api.php` : override `init()` (sortie JSON directe + `exit`), auth `hash_equals` sur header `X-Api-Key`, HTTPS obligatoire (`Tools::usingSecureMode()` ou `HTTP_X_FORWARDED_PROTO`), allowlist IP CSV, sortie `{id_customer, vatNumber, afe}`, codes `200/400/401/403/500`, log `api_access`. Mode simple sans données pro : `200 []` (aligné sur le batch), plus de `404 not_found`.
 
 **Rate-limiting** — `controllers/front/validate.php` exige l'en-tête AJAX puis limite par IP : ≥ `SNT_IP_RATELIMIT_MAX` (défaut 10) appels `insee_call` sur `SNT_IP_RATELIMIT_WINDOW` s (défaut 60) → `429 {status:"rate_limited"}` + log. Compteur porté par la table de logs.
 

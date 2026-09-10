@@ -7,8 +7,10 @@
  *        adresse) sous le champ ;
  *      • recherche par raison sociale + code postal → liste d'établissements →
  *        la sélection renseigne le SIRET (autoritatif) et déclenche le même aperçu.
- *    Le SIRET renseigne aussi l'AFE (SIREN) et le n° de TVA (calcul FR), tous deux
- *    modifiables. La re-vérif serveur au submit fait foi et crée l'adresse siège.
+ *    Le SIRET renseigne le n° de TVA (calcul FR, modifiable). L'AFE reste un champ
+ *    libre, surmonté d'une barre de raccourcis (« Utiliser mon SIREN », « Utiliser
+ *    mon SIRET », « Saisie manuelle ») qui la remplit ou y place le focus sur
+ *    demande. La re-vérif serveur au submit fait foi et crée l'adresse siège.
  *  - Fallback saisie manuelle de la raison sociale quand l'INSEE est indisponible.
  *  - Rend `company` readonly quand SNT_IP_COMPANY_EDITABLE = false.
  */
@@ -273,24 +275,109 @@
     }
 
     // ------------------------------------------------------------------
-    // Adresse de facturation électronique : auto-remplissage depuis le SIRET
+    // Adresse de facturation électronique : raccourcis (barre de boutons)
     // ------------------------------------------------------------------
+    // L'AFE n'est plus auto-remplie : le champ reste libre. On propose au-dessus
+    // du champ une barre de 3 raccourcis (demande du service admin) :
+    //   • « Utiliser mon SIREN »  → recopie le SIREN (9 chiffres du SIRET) ;
+    //   • « Utiliser mon SIRET »  → recopie le SIRET complet (14 chiffres) ;
+    //   • « Saisie manuelle »     → place le focus dans le champ pour saisie libre.
 
-    // Pré-remplit l'AFE avec le SIREN (9 premiers chiffres du SIRET) dès que le
-    // SIRET est renseigné, tant que le client ne l'a pas modifiée lui-même : dès
-    // qu'il y saisit autre chose (drapeau `sntIpTouched`), on ne l'écrase plus.
-    // Le champ reste librement éditable. N'agit qu'en branche FR pro et hors
-    // administration (l'AFE est masquée dans ce cas).
-    function syncEinvoicingFromSiret() {
-        if (!isProChecked() || !isFrCountry() || isAdministrationChecked()) { return; }
-        var einv = fieldByName('einvoicing_address');
-        if (!einv || einv.dataset.sntIpTouched === '1') { return; }
+    // Renvoie le SIREN (9 premiers chiffres du SIRET) si disponible, sinon ''.
+    function sirenFromSiret() {
         var siret = fieldByName('siret');
         var digits = String((siret && siret.value) || '').replace(/\D/g, '');
-        if (digits.length < 9) { return; }
-        // Affectation programmatique : ne déclenche pas d'événement `input`, donc
-        // ne marque pas le champ comme « modifié par l'utilisateur ».
-        einv.value = digits.slice(0, 9);
+        return digits.length >= 9 ? digits.slice(0, 9) : '';
+    }
+
+    // Renvoie le SIRET complet (14 chiffres) si disponible, sinon ''.
+    function siretDigits() {
+        var siret = fieldByName('siret');
+        var digits = String((siret && siret.value) || '').replace(/\D/g, '');
+        return digits.length >= 14 ? digits.slice(0, 14) : '';
+    }
+
+    // Recopie une valeur dans l'AFE — action explicite du client (clic bouton).
+    // Le champ reste ensuite librement éditable ; on marque `sntIpTouched` car
+    // la valeur est désormais maîtrisée par le client. N'agit qu'en branche FR
+    // pro hors administration (l'AFE est masquée dans ce cas).
+    function applyEinvoicingValue(value) {
+        if (!isProChecked() || !isFrCountry() || isAdministrationChecked()) { return; }
+        var einv = fieldByName('einvoicing_address');
+        if (!einv || !value) { return; }
+        einv.value = value;
+        einv.dataset.sntIpTouched = '1';
+        // Émet `input` pour rejouer les validations éventuelles du thème.
+        try { einv.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+        einv.focus();
+    }
+
+    function fillEinvoicingWithSiren() { applyEinvoicingValue(sirenFromSiret()); }
+    function fillEinvoicingWithSiret() { applyEinvoicingValue(siretDigits()); }
+
+    // « Saisie manuelle » : ne remplit rien, place seulement le focus dans le
+    // champ (et sélectionne son contenu pour un remplacement immédiat). Marque le
+    // champ comme « modifié » pour préserver la saisie libre du client.
+    function focusEinvoicingForManualEntry() {
+        var einv = fieldByName('einvoicing_address');
+        if (!einv) { return; }
+        einv.dataset.sntIpTouched = '1';
+        einv.focus();
+        try { einv.select(); } catch (e) {}
+    }
+
+    // Construit (une seule fois) la barre de raccourcis AU-DESSUS du champ AFE,
+    // dans SA colonne (largeur auto). Renvoie la barre.
+    function ensureAfeToolbar() {
+        var einv = fieldByName('einvoicing_address');
+        var col = inlineContainerOf(einv);
+        if (!col || !einv) { return null; }
+        var existing = col.querySelector('.snt-ip-afe-tools');
+        if (existing) { return existing; }
+
+        var bar = document.createElement('div');
+        bar.className = 'snt-ip-afe-tools';
+        bar.appendChild(makeAfeButton('snt-ip-use-siren', 'Utiliser mon SIREN', fillEinvoicingWithSiren));
+        bar.appendChild(makeAfeButton('snt-ip-use-siret', 'Utiliser mon SIRET', fillEinvoicingWithSiret));
+        bar.appendChild(makeAfeButton('snt-ip-manual-entry', 'Saisie manuelle', focusEinvoicingForManualEntry));
+
+        // Insère la barre juste AVANT le champ (demande du service admin).
+        col.insertBefore(bar, einv);
+        return bar;
+    }
+
+    function makeAfeButton(cls, label, onClick) {
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-secondary ' + cls;
+        btn.textContent = label;
+        btn.addEventListener('click', onClick);
+        return btn;
+    }
+
+    // Active/désactive les boutons SIREN/SIRET selon la disponibilité du SIRET
+    // saisi. « Saisie manuelle » reste toujours actif.
+    function updateAfeToolbar() {
+        var bar = ensureAfeToolbar();
+        if (!bar) { return; }
+
+        var siren = sirenFromSiret();
+        var sirenBtn = bar.querySelector('.snt-ip-use-siren');
+        if (sirenBtn) {
+            sirenBtn.disabled = !siren;
+            sirenBtn.title = siren
+                ? 'Renseigner l\'AFE avec votre SIREN (' + siren + ').'
+                : 'Renseignez d\'abord votre SIRET pour utiliser ce raccourci.';
+        }
+
+        var siret = siretDigits();
+        var siretBtn = bar.querySelector('.snt-ip-use-siret');
+        if (siretBtn) {
+            siretBtn.disabled = !siret;
+            siretBtn.title = siret
+                ? 'Renseigner l\'AFE avec votre SIRET (' + siret + ').'
+                : 'Renseignez d\'abord votre SIRET complet (14 chiffres) pour utiliser ce raccourci.';
+        }
     }
 
     // ------------------------------------------------------------------
@@ -356,7 +443,9 @@
             if (wrapper) { wrapper.style.display = ''; }
             einv.setAttribute('required', 'required');
             einv.dataset.sntIpRequired = '1';
-            syncEinvoicingFromSiret();
+            // Plus d'auto-remplissage : le champ reste libre. On (ré)affiche
+            // seulement le bouton-raccourci et on ajuste son état.
+            updateAfeToolbar();
         }
     }
 
@@ -769,9 +858,10 @@
             return;
         }
         input.value = siret;
-        // Pré-remplit l'adresse de facturation électronique (SIREN) et le n° de
-        // TVA intracom. calculé, tous deux modifiables ensuite par le client.
-        syncEinvoicingFromSiret();
+        // L'AFE n'est plus auto-remplie : on active seulement le bouton-raccourci
+        // « Utiliser mon SIREN ». Le n° de TVA intracom. reste, lui, calculé et
+        // pré-rempli (modifiable ensuite par le client).
+        updateAfeToolbar();
         syncVatFromSiret();
         if (siret === lastSearchedSiret) {
             // Déjà interrogé pour cette valeur : pas de nouvel appel INSEE.
@@ -963,7 +1053,8 @@
     }
 
     // Sélection d'un établissement : renseigne le SIRET (autoritatif) et déclenche
-    // l'aperçu + les auto-remplissages, sans nouvel appel INSEE (données déjà là).
+    // l'aperçu + le calcul TVA, sans nouvel appel INSEE (données déjà là). L'AFE
+    // n'est plus auto-remplie ; on rafraîchit seulement le raccourci SIREN.
     function selectEstablishment(item) {
         if (!item) { return; }
         var siret = fieldByName('siret');
@@ -981,7 +1072,7 @@
             postcode: item.postcode,
             city: item.city
         }, !!item.closed);
-        syncEinvoicingFromSiret();
+        updateAfeToolbar();
         syncVatFromSiret();
         setStatus(item.closed ? 'pending' : 'ok',
             item.closed ? 'Établissement fermé à l\'INSEE — vérifiez votre choix.' : '');
@@ -1132,6 +1223,9 @@
             siretInput.addEventListener('input', function () {
                 lastSearchedSiret = '';
                 hideSiretPreview();
+                // Active/désactive le raccourci « Utiliser mon SIREN » au fil de
+                // la saisie (dispo dès 9 chiffres).
+                updateAfeToolbar();
             });
         }
 
@@ -1147,11 +1241,11 @@
             vatInput.addEventListener('blur', onVatBlur);
         }
 
-        // Adresse de facturation électronique : auto-remplie depuis le SIRET tant
-        // que le client n'y a pas touché. Toute saisie manuelle pose le drapeau
-        // `sntIpTouched` pour ne plus jamais l'écraser. Une valeur déjà présente au
-        // chargement (édition d'un compte) est d'emblée considérée « modifiée »,
-        // pour préserver l'AFE enregistrée.
+        // Adresse de facturation électronique : champ libre. Elle n'est plus
+        // auto-remplie ; le client la saisit, ou utilise la barre de raccourcis
+        // au-dessus du champ (cf. ensureAfeToolbar). Toute saisie manuelle pose le
+        // drapeau `sntIpTouched`. Une valeur déjà présente au chargement (édition
+        // d'un compte) est d'emblée considérée « modifiée ».
         var einvInput = fieldByName('einvoicing_address');
         if (einvInput) {
             if (String(einvInput.value || '').trim() !== '') {

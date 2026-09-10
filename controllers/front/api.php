@@ -77,7 +77,12 @@ class Snt_inscription_proApiModuleFrontController extends ModuleFrontController
 
         $row = (new ProCustomerRepository())->findApiViewByCustomer($idCustomer);
         if ($row === null) {
-            $this->json(404, ['error' => 'not_found'], false, $idCustomer, $ip, 'Aucune donnée pro pour ce client');
+            // Client sans données pro = cas métier NORMAL, pas une erreur HTTP.
+            // On renvoie 200 avec un tableau vide, par cohérence avec le mode
+            // batch (respondBatch omet simplement les ids introuvables). Les
+            // consommateurs (n8n, ERP) distinguent « trouvé / absent » sur le
+            // corps vide, sans avoir à traiter un statut d'erreur.
+            $this->json(200, [], true, $idCustomer, $ip, 'Aucune donnée pro pour ce client');
         }
 
         $row['id_customer'] = $idCustomer;

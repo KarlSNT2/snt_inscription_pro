@@ -55,25 +55,33 @@
     color: #6b7280;
 }
 
-/* Bouton « Utiliser mon SIREN » — inline, sous le champ AFE, largeur auto.
-   On force width:auto pour contrer les thèmes qui étirent tout .btn à 100%. */
-.snt-ip-btn-siren {
+/* Barre de raccourcis AFE — placée AU-DESSUS du champ « adresse de facturation
+   électronique » (demande du service admin). Regroupe 3 boutons : « Utiliser mon
+   SIREN », « Utiliser mon SIRET », « Saisie manuelle ». Passe à la ligne sur
+   petit écran. */
+.snt-ip-afe-tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 0.5rem;
+    margin-bottom: 0.5rem;
+    width: 100%;
+}
+
+/* Boutons de la barre AFE — largeur auto pour contrer les thèmes qui étirent
+   tout .btn à 100%. */
+.snt-ip-afe-tools .btn {
     display: inline-block !important;
     width: auto !important;
-    margin-top: 0.35rem;
+    flex: 0 0 auto;
+    margin: 0;
     padding: 0.25rem 0.75rem;
     font-size: 0.85em;
 }
 
-/* Bouton « Utiliser mon SIREN » — recopie le SIREN dans le champ « adresse de
-   facturation électronique ». Inline sous le champ, largeur auto (même logique
-   que .snt-ip-btn-siren pour contrer les thèmes qui étirent .btn à 100%). */
-.snt-ip-use-siren {
-    display: inline-block !important;
-    width: auto !important;
-    margin-top: 0.35rem;
-    padding: 0.25rem 0.75rem;
-    font-size: 0.85em;
+/* Bouton désactivé (SIRET pas encore saisi) : grisé, curseur d'interdiction. */
+.snt-ip-afe-tools .btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
 }
 
 .snt-ip-readonly {
@@ -200,6 +208,24 @@
 .snt-ip-tooltip:hover .snt-ip-tooltip-popup,
 .snt-ip-tooltip-icon:focus + .snt-ip-tooltip-popup {
     display: block;
+}
+
+/* Mobile : la pastille étant collée au bord gauche du libellé, une bulle
+   centrée (translateX(-50%)) déborde hors de l'écran à gauche (seule la
+   moitié droite reste visible). On l'ancre donc au bord gauche de la
+   pastille et on borne sa largeur au viewport ; la flèche est ramenée
+   au-dessus de la pastille. */
+@media (max-width: 576px) {
+    .snt-ip-tooltip-popup {
+        left: 0;
+        transform: none;
+        max-width: calc(100vw - 32px);
+    }
+
+    .snt-ip-tooltip-popup::after {
+        left: 0.8em;
+        transform: translateX(-50%);
+    }
 }
 
 /* ------------------------------------------------------------------
