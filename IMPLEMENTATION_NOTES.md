@@ -397,6 +397,24 @@ du Journal, purge du cache VIES sur « Purger ». Expose `SNT_IP_VIES_ENABLE` au
 
 ---
 
+## 8octies. Nouveautés v1.9.0 — inscription réservée aux pros
+
+**Option `SNT_IP_ALLOW_INDIVIDUAL`** (switch BO « Autoriser l'inscription des
+particuliers », défaut **0**). Désactivée :
+- le choix « Particulier » (`is_pro = '0'`) est retiré du radio « Type de compte »
+  et « Professionnel » est pré-sélectionné (`hookAdditionalCustomerFormFields`) ;
+- un `is_pro` autre que `1`/`2` est refusé côté serveur
+  (`hookValidateCustomerFormFields`), contre une requête forgée ;
+- exception : un client **déjà particulier** qui édite son compte (`identity`)
+  garde le choix « Particulier » — on ne le force pas à devenir pro
+  (`isIndividualSignupAllowed()`).
+
+S'applique aussi à la commande invité (même formulaire client). Pour supprimer la
+commande invité, désactiver `PS_GUEST_CHECKOUT_ENABLED` en BO. Aucun JS modifié,
+aucune migration DB : `upgrade-1.9.0.php` crée seulement la clé de config.
+
+---
+
 ## 9. Test manuel de bout en bout (Phase 1+2)
 
 - [x] Installation propre sur PS 8.x, table créée, colonne `ps_customer.siret` présente, hooks enregistrés, clé endpoint générée.

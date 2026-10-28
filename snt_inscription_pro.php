@@ -49,6 +49,10 @@ class Snt_Inscription_Pro extends Module
         // sociale (reset lors de la migration) y sont ajoutés ; le bandeau
         // d'invitation ne s'affiche qu'aux membres de ce groupe. 0 => désactivé.
         'SNT_IP_INVITE_GROUP_ID'   => '0',
+        // Choix « Particulier » à l'inscription. 0 => seuls les comptes pro
+        // (Professionnel / Administration) peuvent être créés ; les particuliers
+        // déjà inscrits conservent leur statut à l'édition de leur compte.
+        'SNT_IP_ALLOW_INDIVIDUAL'  => '0',
     ];
 
     private const HOOKS = [
@@ -92,7 +96,7 @@ class Snt_Inscription_Pro extends Module
     {
         $this->name          = 'snt_inscription_pro';
         $this->tab           = 'front_office_features';
-        $this->version       = '1.8.0';
+        $this->version       = '1.9.0';
         $this->author        = 'SNT2';
         $this->need_instance = 0;
         $this->bootstrap     = true;
@@ -366,19 +370,29 @@ class Snt_Inscription_Pro extends Module
         // traite '0' comme vide (test de type empty()) et lèverait « Champ requis »
         // sur un particulier. Le radio a toujours une valeur (Particulier
         // pré-sélectionné via setValue), donc l'obligation serveur est inutile.
+        // Inscription des particuliers désactivée (SNT_IP_ALLOW_INDIVIDUAL) : le
+        // choix « Particulier » est retiré et « Professionnel » pré-sélectionné.
+        $typeChoices = [
+            '0' => $this->l('Particulier'),
+            '1' => $this->l('Professionnel'),
+            // Administration : compte pro identique au professionnel, mais hors
+            // périmètre de la facturation électronique (AFE non demandée, cf. JS
+            // et validateFrenchPro). Persisté via la colonne `is_administration`.
+            '2' => $this->l('Administration'),
+        ];
+        $typeValue = $prefill['is_pro'];
+        if (!$this->isIndividualSignupAllowed()) {
+            unset($typeChoices['0']);
+            if ($typeValue === '0') {
+                $typeValue = '1';
+            }
+        }
         $additions[] = (new FormField())
             ->setName('is_pro')
             ->setType('radio-buttons')
             ->setLabel($this->l('Type de compte'))
-            ->setValue($prefill['is_pro'])
-            ->setAvailableValues([
-                '0' => $this->l('Particulier'),
-                '1' => $this->l('Professionnel'),
-                // Administration : compte pro identique au professionnel, mais hors
-                // périmètre de la facturation électronique (AFE non demandée, cf. JS
-                // et validateFrenchPro). Persisté via la colonne `is_administration`.
-                '2' => $this->l('Administration'),
-            ])
+            ->setValue($typeValue)
+            ->setAvailableValues($typeChoices)
             ->setRequired(false);
 
         // pro_country : pays de l'entreprise. Aiguille le parcours :
@@ -523,9 +537,18 @@ class Snt_Inscription_Pro extends Module
         $this->pendingInseeAddress = [];
 
         // Professionnel ('1') ou Administration ('2') : même validation pro.
-        // Particulier ('0') : rien à valider.
+        // Particulier ('0') : rien à valider, sauf si l'inscription des
+        // particuliers est désactivée — on refuse alors côté serveur (le choix
+        // est retiré du formulaire, mais une requête forgée pourrait le poster).
         $isProValue = (string) $this->extractFieldValue($fields, 'is_pro');
         if ($isProValue !== '1' && $isProValue !== '2') {
+            if (!$this->isIndividualSignupAllowed()) {
+                foreach ($fields as $field) {
+                    if ($field->getName() === 'is_pro') {
+                        $field->addError($this->l('L\'inscription est réservée aux professionnels et aux administrations.'));
+                    }
+                }
+            }
             return $errors;
         }
 
@@ -1354,6 +1377,21 @@ class Snt_Inscription_Pro extends Module
             && (int) $this->context->customer->id > 0;
     }
 
+    /**
+     * Le type de compte « Particulier » est-il proposé / accepté ? Oui si
+     * l'option SNT_IP_ALLOW_INDIVIDUAL est active, ou si le client édite un
+     * compte déjà particulier (on ne le force pas à devenir pro pour modifier
+     * ses informations).
+     */
+    private function isIndividualSignupAllowed(): bool
+    {
+        if ((bool) Configuration::get('SNT_IP_ALLOW_INDIVIDUAL')) {
+            return true;
+        }
+        return $this->isEditingExistingCustomer()
+            && $this->prefillFromCustomer($this->context->customer)['is_pro'] === '0';
+    }
+
     private function getRepository(): ProCustomerRepository
     {
         if ($this->repository === null) {
@@ -1726,6 +1764,7 @@ class Snt_Inscription_Pro extends Module
                             'name'  => 'name',
                         ],
                     ],
+                    $this->switchInput('SNT_IP_ALLOW_INDIVIDUAL',   $this->l('Autoriser l\'inscription des particuliers')),
                     $this->switchInput('SNT_IP_SIRET_REQUIRED',     $this->l('SIRET obligatoire si professionnel')),
                     $this->switchInput('SNT_IP_WRITE_COMPANY',      $this->l('Écrire la raison sociale depuis INSEE')),
                     $this->switchInput('SNT_IP_COMPANY_EDITABLE',   $this->l('Autoriser l\'édition libre de la raison sociale')),
